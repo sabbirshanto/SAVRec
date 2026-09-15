@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local data / checkpoints / large artifacts
+*.pt
+*.pth
+*.ckpt
+*.parquet
+*.npy
+*.npz
+*.pkl
+checkpoints/
+artifacts/
+outputs/
+
+# Secrets
+kaggle.json
+.env
+
+# OS
+.DS_Store
