@@ -1,0 +1,14 @@
+numpy
+pandas
+scipy
+scikit-learn
+pyarrow
+torch
+torchvision
+transformers
+sentence-transformers
+requests
+Pillow
+tqdm
+matplotlib
+kaggle

@@ -1,0 +1,11555 @@
+
+# %% PUBLIC NOTEBOOK CELL 1
+# ==============================================================================
+# CELL 1 — JOURNAL-REPRODUCIBLE SETUP
+# ==============================================================================
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, json, math, random, gc, time, copy, hashlib, platform
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from scipy import stats
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Runtime
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+if DEVICE != 'cuda':
+    raise RuntimeError('A CUDA GPU is required for the full experiment.')
+
+# ------------------------------------------------------------------------------
+# Frozen benchmark artifacts. These are model-independent and are intentionally
+# reused rather than regenerated during every training run.
+# ------------------------------------------------------------------------------
+DRIVE_PATH = os.environ.get(
+    'SAVREC_DATA_ROOT',
+    '/content/drive/MyDrive/MS_new/Thesis_HotelRec_Data'
+)
+TRAIN_FILE = os.path.join(DRIVE_PATH, 'train_v6.parquet')
+VAL_FILE = os.path.join(DRIVE_PATH, 'val_v6.parquet')
+TEST_FILE = os.path.join(DRIVE_PATH, 'test_v6.parquet')
+CATALOG_FILE = os.path.join(DRIVE_PATH, 'evaluation_catalog_items_v6.parquet')
+USER_MAP_FILE = os.path.join(DRIVE_PATH, 'user_map_v6.json')
+ITEM_MAP_FILE = os.path.join(DRIVE_PATH, 'item_map_v6.json')
+SBERT_FILE = os.path.join(DRIVE_PATH, 'item_text_embeddings_sbert_v6.pt')
+CLIP_PER_IMAGE_FILE = os.path.join(DRIVE_PATH, 'clip_per_image_v4.pt')
+
+# ------------------------------------------------------------------------------
+# NEW experiment root. No old checkpoint is loaded for final reporting.
+# ------------------------------------------------------------------------------
+EXPERIMENT_ROOT = os.path.join(DRIVE_PATH, 'SAVRec_V7_JOURNAL_FINAL_CLEAN')
+CHECKPOINT_DIR = os.path.join(EXPERIMENT_ROOT, 'checkpoints')
+RESULT_DIR = os.path.join(EXPERIMENT_ROOT, 'results')
+ABLATION_DIR = os.path.join(EXPERIMENT_ROOT, 'ablations')
+FIGURE_DIR = os.path.join(EXPERIMENT_ROOT, 'figures')
+TABLE_DIR = os.path.join(EXPERIMENT_ROOT, 'tables')
+ARTIFACT_DIR = os.path.join(EXPERIMENT_ROOT, 'artifacts')
+for p in [EXPERIMENT_ROOT, CHECKPOINT_DIR, RESULT_DIR, ABLATION_DIR, FIGURE_DIR, TABLE_DIR, ARTIFACT_DIR]:
+    os.makedirs(p, exist_ok=True)
+
+# Reproducibility / model constants
+SEEDS = [42, 1, 7]
+EMBED_DIM = 64
+TEXT_DIM = 384
+IMAGE_DIM = 512
+MAX_IMAGES = 32
+K_LAYERS = 2
+FUSION_DIM = 128
+NUM_HEADS = 4
+DROPOUT = 0.10
+IMAGE_CHUNK = 64
+TEST_BATCH_SIZE = 64
+
+# Training protocol. Test is NEVER used by training/selection cells in this rerun.
+# IMPORTANT: this historical V6 test split has been inspected in prior development,
+# so the paper/code must not describe it as an untouched or sealed holdout.
+LR = 1e-3
+MAX_EPOCHS = 30
+PATIENCE = 5
+GRAD_CLIP = 5.0
+TRAIN_BATCH_SIZE = 1024
+SAVREC_BATCH_SIZE = 512
+VAL_BATCH_SIZE = 64
+MIN_DELTA = 1e-8
+
+# Validation selection can be set to an integer number of USERS for a faster
+# fixed subset. For the final journal run, keep None to use every validation user.
+VAL_SELECTION_USERS = None
+
+
+# Invalid/anonymous user identifiers are excluded BEFORE any user map, graph,
+# history, evidence, or evaluation structure is constructed.
+INVALID_USER_IDS = {
+    '',
+    '/undefined',
+    'undefined',
+    'nan',
+    'none',
+    'null',
+}
+
+# Weight decays are frozen before final evaluation. SAVRec and its matched
+# UVCRec backbone use the same weight decay for a fair central comparison.
+MODEL_WEIGHT_DECAY = {
+    'LightGCN': 1e-2,
+    'Text-Only': 1e-3,
+    'VBPR': 1e-3,
+    'MMGCN': 1e-4,
+    'BM3': 1e-3,
+    'UVCRec-MG-Attn': 1e-4,
+    'SAVRec': 1e-4,
+}
+
+print('='*100)
+print('SAVRec V7 — JOURNAL-REPRODUCIBLE FRESH EXPERIMENT')
+print('='*100)
+print('Device          :', DEVICE)
+print('Seeds           :', SEEDS)
+print('Frozen data root:', DRIVE_PATH)
+print('New output root :', EXPERIMENT_ROOT)
+print('PyTorch         :', torch.__version__)
+if torch.cuda.is_available():
+    print('GPU             :', torch.cuda.get_device_name(0))
+print('='*100)
+
+
+# %% PUBLIC NOTEBOOK CELL 2
+# ==============================================================================
+# CELL 2 — LOAD RAW V6 ARTIFACTS + BUILD CLEAN JOURNAL BENCHMARK VIEW
+# ==============================================================================
+# This cell is the single source of truth for the final V6 data/feature state.
+# It uses the V6 artifacts that were used by the final-results pipeline:
+#   train_v6 / val_v6 / test_v6
+#   user_map_v6 / item_map_v6
+#   item_text_embeddings_sbert_v6.pt
+#   clip_per_image_v4.pt
+#   item_visual_embeddings_clip_v4.pt
+#
+# No model is trained here and no test result is used for model selection.
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 2 — LOAD RAW V6 ARTIFACTS + BUILD CLEAN JOURNAL BENCHMARK VIEW')
+print('=' * 100)
+
+required_files = [
+    TRAIN_FILE,
+    VAL_FILE,
+    TEST_FILE,
+    CATALOG_FILE,
+    USER_MAP_FILE,
+    ITEM_MAP_FILE,
+    SBERT_FILE,
+    CLIP_PER_IMAGE_FILE,
+]
+
+missing_files = [p for p in required_files if not os.path.exists(p)]
+
+if missing_files:
+    raise FileNotFoundError(
+        'Missing required V6 files:\n' + '\n'.join(missing_files)
+    )
+
+# ------------------------------------------------------------------------------
+# Load RAW frozen V6 datasets
+# ------------------------------------------------------------------------------
+raw_train_df = pd.read_parquet(TRAIN_FILE)
+raw_val_df = pd.read_parquet(VAL_FILE)
+raw_test_df = pd.read_parquet(TEST_FILE)
+catalog_df = pd.read_parquet(CATALOG_FILE)
+
+for df_ in [raw_train_df, raw_val_df, raw_test_df, catalog_df]:
+    for col in ['user_id', 'hotel_id', 'img_hotel_id']:
+        if col in df_.columns:
+            df_[col] = df_[col].astype(str).str.strip()
+
+# Preserve the historical V6 sizes as a provenance check BEFORE cleaning.
+raw_expected_sizes = {
+    'train': 265_317,
+    'val': 9_084,
+    'test': 1_137,
+}
+assert len(raw_train_df) == raw_expected_sizes['train'], len(raw_train_df)
+assert len(raw_val_df) == raw_expected_sizes['val'], len(raw_val_df)
+assert len(raw_test_df) == raw_expected_sizes['test'], len(raw_test_df)
+
+# ------------------------------------------------------------------------------
+# Remove invalid / anonymous user identifiers BEFORE any user-side state exists.
+# ------------------------------------------------------------------------------
+def _invalid_user_mask(df):
+    normalized = df['user_id'].astype(str).str.strip().str.lower()
+    return normalized.isin(INVALID_USER_IDS)
+
+removed_counts = {}
+clean_splits = {}
+for split_name, raw_df in [
+    ('train', raw_train_df),
+    ('val', raw_val_df),
+    ('test', raw_test_df),
+]:
+    bad = _invalid_user_mask(raw_df)
+    removed_counts[split_name] = int(bad.sum())
+    clean_splits[split_name] = raw_df.loc[~bad].copy().reset_index(drop=True)
+
+train_df = clean_splits['train']
+val_df = clean_splits['val']
+test_df = clean_splits['test']
+
+print('Invalid/anonymous user interactions removed:')
+for split_name in ['train', 'val', 'test']:
+    print(f'  {split_name:<5}: {removed_counts[split_name]:,}')
+
+# No invalid placeholder may survive cleaning.
+for split_name, df_ in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    assert not _invalid_user_mask(df_).any(), f'Invalid user survived in {split_name}'
+
+# ------------------------------------------------------------------------------
+# Load historical maps. Item map remains canonical; user map is rebuilt cleanly.
+# ------------------------------------------------------------------------------
+with open(USER_MAP_FILE, 'r') as f:
+    raw_user2idx = json.load(f)
+with open(ITEM_MAP_FILE, 'r') as f:
+    item2idx = json.load(f)
+
+raw_user2idx = {str(k).strip(): int(v) for k, v in raw_user2idx.items()}
+item2idx = {str(k).strip(): int(v) for k, v in item2idx.items()}
+
+# All retained users must exist in the historical V6 map.
+active_users = set(train_df['user_id'].astype(str))
+active_users |= set(val_df['user_id'].astype(str))
+active_users |= set(test_df['user_id'].astype(str))
+
+missing_active_users = sorted(active_users - set(raw_user2idx.keys()))
+if missing_active_users:
+    raise RuntimeError(
+        f'{len(missing_active_users)} retained users are absent from user_map_v6. '
+        f'First IDs: {missing_active_users[:10]}'
+    )
+
+# Preserve original V6 user ordering where possible, but compact indices after
+# removing invalid/unused users. This is deterministic and auditable.
+ordered_active_users = sorted(active_users, key=lambda u: raw_user2idx[u])
+user2idx = {u: idx for idx, u in enumerate(ordered_active_users)}
+
+num_users = len(user2idx)
+num_items = len(item2idx)
+idx2user = {idx: key for key, idx in user2idx.items()}
+idx2item = {idx: key for key, idx in item2idx.items()}
+
+assert len(idx2user) == num_users
+assert len(idx2item) == num_items
+assert num_items == 3_322
+
+print(f'Clean users : {num_users:,}')
+print(f'Items       : {num_items:,}')
+
+# Save cleaned benchmark views without modifying historical V6 files.
+train_df.to_parquet(os.path.join(ARTIFACT_DIR, 'train_clean_v7.parquet'), index=False)
+val_df.to_parquet(os.path.join(ARTIFACT_DIR, 'val_clean_v7.parquet'), index=False)
+test_df.to_parquet(os.path.join(ARTIFACT_DIR, 'test_clean_v7.parquet'), index=False)
+with open(os.path.join(ARTIFACT_DIR, 'user_map_clean_v7.json'), 'w') as f:
+    json.dump(user2idx, f, indent=2)
+
+# ------------------------------------------------------------------------------
+# Cleaned split sanity
+# ------------------------------------------------------------------------------
+assert len(train_df) > 0 and len(val_df) > 0 and len(test_df) > 0
+assert set(val_df['user_id']).issubset(set(train_df['user_id']))
+assert set(test_df['user_id']).issubset(set(train_df['user_id']))
+
+# All train/val/test targets must exist in the V6 map.
+for name, df_ in [('train_df', train_df), ('val_df', val_df), ('test_df', test_df)]:
+    missing_ids = sorted({
+        str(x) for x in df_['img_hotel_id'] if str(x) not in item2idx
+    })
+    if missing_ids:
+        raise RuntimeError(
+            f'{name} contains {len(missing_ids)} hotel IDs absent from item_map_v6. '
+            f'First IDs: {missing_ids[:10]}'
+        )
+
+# ------------------------------------------------------------------------------
+# Leakage / duplicate checks
+# ------------------------------------------------------------------------------
+train_pairs = set(zip(train_df['user_id'], train_df['img_hotel_id']))
+val_pairs = set(zip(val_df['user_id'], val_df['img_hotel_id']))
+test_pairs = set(zip(test_df['user_id'], test_df['img_hotel_id']))
+
+assert len(train_pairs & val_pairs) == 0
+assert len(train_pairs & test_pairs) == 0
+assert len(val_pairs & test_pairs) == 0
+
+for name, df_ in [('train_df', train_df), ('val_df', val_df), ('test_df', test_df)]:
+    dup = int(df_.duplicated(['user_id', 'img_hotel_id']).sum())
+    assert dup == 0, f'{name} contains {dup} duplicate user-hotel interactions'
+
+print('✅ Cleaned V7 split integrity passed.')
+
+# ------------------------------------------------------------------------------
+# Build train graph
+# ------------------------------------------------------------------------------
+u_idxs = np.asarray([user2idx[str(u)] for u in train_df['user_id']], dtype=np.int64)
+i_idxs = np.asarray([item2idx[str(i)] for i in train_df['img_hotel_id']], dtype=np.int64)
+
+R = sp.coo_matrix(
+    (np.ones(len(u_idxs), dtype=np.float32), (u_idxs, i_idxs)),
+    shape=(num_users, num_items)
+)
+
+assert R.nnz == len(train_df), (R.nnz, len(train_df))
+
+adj = sp.bmat([[None, R], [R.T, None]], format='csr')
+
+deg = np.asarray(adj.sum(axis=1)).ravel()
+deg[deg == 0] = 1.0
+D_inv = sp.diags(np.power(deg, -0.5))
+norm = D_inv.dot(adj).dot(D_inv).tocoo()
+
+sparse_adj = torch.sparse_coo_tensor(
+    torch.from_numpy(np.vstack([norm.row, norm.col]).astype(np.int64)),
+    torch.from_numpy(norm.data.astype(np.float32)),
+    norm.shape,
+    device=DEVICE
+).coalesce()
+
+train_users = torch.tensor(u_idxs, dtype=torch.long, device=DEVICE)
+train_items = torch.tensor(i_idxs, dtype=torch.long, device=DEVICE)
+u_all = train_users
+pos_all = train_items
+
+# ------------------------------------------------------------------------------
+# SBERT text features
+# ------------------------------------------------------------------------------
+sbert_raw = torch.load(SBERT_FILE, weights_only=False)
+
+sbert_mat = np.zeros((num_items, TEXT_DIM), dtype=np.float32)
+missing_sbert = []
+
+for iid, idx in item2idx.items():
+    if iid not in sbert_raw:
+        missing_sbert.append(iid)
+        continue
+    vec = np.asarray(sbert_raw[iid], dtype=np.float32)
+    if vec.shape != (TEXT_DIM,):
+        raise ValueError(f'Unexpected SBERT shape for {iid}: {vec.shape}')
+    sbert_mat[idx] = vec
+
+if missing_sbert:
+    raise RuntimeError(f'Missing SBERT vectors: {len(missing_sbert)}')
+
+sbert_tensor = F.normalize(
+    torch.tensor(sbert_mat, dtype=torch.float32, device=DEVICE),
+    p=2,
+    dim=-1
+)
+
+# ------------------------------------------------------------------------------
+# Per-image CLIP features — exact V6 source
+# ------------------------------------------------------------------------------
+per_img = torch.load(
+    CLIP_PER_IMAGE_FILE,
+    weights_only=False
+)
+
+img_3d = torch.zeros(
+    (num_items, MAX_IMAGES, IMAGE_DIM),
+    dtype=torch.float32,
+    device=DEVICE
+)
+
+img_msk = torch.zeros(
+    (num_items, MAX_IMAGES),
+    dtype=torch.bool,
+    device=DEVICE
+)
+
+missing_visual = []
+
+for iid, idx in item2idx.items():
+    if iid not in per_img:
+        missing_visual.append(iid)
+        continue
+
+    arr = np.asarray(per_img[iid], dtype=np.float32)
+
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+
+    if arr.ndim != 2 or arr.shape[1] != IMAGE_DIM:
+        raise ValueError(
+            f'Unexpected per-image CLIP shape for {iid}: {arr.shape}'
+        )
+
+    n = min(arr.shape[0], MAX_IMAGES)
+
+    if n > 0:
+        img_3d[idx, :n] = torch.from_numpy(arr[:n]).to(DEVICE)
+        img_msk[idx, :n] = True
+
+if missing_visual:
+    raise RuntimeError(f'Missing per-image visual features: {len(missing_visual)}')
+
+# ------------------------------------------------------------------------------
+# Exact V6 hotel visual representation
+# ------------------------------------------------------------------------------
+valid = img_msk.sum(1, keepdim=True).clamp(min=1)
+
+hotel_mean = F.normalize(
+    (img_3d * img_msk.unsqueeze(-1).float()).sum(1) / valid,
+    p=2,
+    dim=-1
+)
+
+# ------------------------------------------------------------------------------
+# TRAIN-V6 user visual profiles
+# ------------------------------------------------------------------------------
+u_hist = (
+    train_df
+    .groupby('user_id')['img_hotel_id']
+    .apply(
+        lambda x: [
+            item2idx[str(i)]
+            for i in x
+            if str(i) in item2idx
+        ]
+    )
+    .to_dict()
+)
+
+u_vis = torch.zeros(
+    (num_users, IMAGE_DIM),
+    dtype=torch.float32,
+    device=DEVICE
+)
+
+for user_key, user_idx in user2idx.items():
+    history = u_hist.get(str(user_key), [])
+    if history:
+        u_vis[user_idx] = hotel_mean[history].mean(0)
+
+u_vis = F.normalize(
+    u_vis,
+    p=2,
+    dim=-1
+)
+
+# ------------------------------------------------------------------------------
+# Training-history masking
+# ------------------------------------------------------------------------------
+train_user_mask_dict = {}
+
+for uid, iid in zip(u_idxs, i_idxs):
+    train_user_mask_dict.setdefault(int(uid), set()).add(int(iid))
+
+train_user_mask_dict = {
+    uid: sorted(items)
+    for uid, items in train_user_mask_dict.items()
+}
+
+# ------------------------------------------------------------------------------
+# NOTE: No modality-informed hard-negative structure is built here.
+# Main BPR experiments use uniform unseen-item negatives so Text-Only and
+# collaborative baselines do not receive CLIP information through sampling.
+# ------------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# RAW FEATURE -> CANONICAL INDEX ALIGNMENT AUDIT
+# ------------------------------------------------------------------------------
+# The tensors above are populated by raw hotel ID -> item2idx, never by file row
+# position. Verify three deterministic catalog positions directly against source
+# artifacts so a silent row-order mismatch cannot survive this cell.
+# ------------------------------------------------------------------------------
+audit_indices = sorted(set([0, num_items // 2, num_items - 1]))
+
+for idx in audit_indices:
+    iid = idx2item[idx]
+
+    raw_text = torch.as_tensor(
+        np.asarray(sbert_raw[iid], dtype=np.float32),
+        dtype=torch.float32,
+        device=DEVICE
+    )
+    raw_text = F.normalize(raw_text, p=2, dim=0)
+
+    if not torch.allclose(
+        sbert_tensor[idx], raw_text, atol=1e-6, rtol=1e-5
+    ):
+        raise RuntimeError(
+            f'SBERT mapping mismatch: item index {idx}, hotel ID {iid}'
+        )
+
+    raw_images = np.asarray(per_img[iid], dtype=np.float32)
+    if raw_images.ndim == 1:
+        raw_images = raw_images.reshape(1, -1)
+
+    if raw_images.shape[0] < 1:
+        raise RuntimeError(f'No visual image for mapped hotel {iid}')
+
+    raw_first = torch.as_tensor(
+        raw_images[0], dtype=torch.float32, device=DEVICE
+    )
+
+    if not torch.allclose(
+        img_3d[idx, 0], raw_first, atol=1e-6, rtol=1e-5
+    ):
+        raise RuntimeError(
+            f'CLIP mapping mismatch: item index {idx}, hotel ID {iid}'
+        )
+
+print('✅ Raw SBERT/CLIP hotel-ID → item-index alignment audit passed.')
+
+# ------------------------------------------------------------------------------
+# Canonical immutable copies used by later analyses
+# ------------------------------------------------------------------------------
+CANONICAL_IMG_3D = img_3d.detach().clone()
+CANONICAL_IMG_MSK = img_msk.detach().bool().clone()
+CANONICAL_HOTEL_MEAN = hotel_mean.detach().clone()
+CANONICAL_U_VIS = u_vis.detach().clone()
+
+print('\n' + '=' * 100)
+print('CLEANED V7 FEATURE SUMMARY')
+print('=' * 100)
+print(f'Train interactions : {len(train_df):,}')
+print(f'Validation         : {len(val_df):,}')
+print(f'Test interactions  : {len(test_df):,}')
+print(f'Test users         : {test_df["user_id"].nunique():,}')
+print(f'Users              : {num_users:,}')
+print(f'Items              : {num_items:,}')
+print(f'Valid image slots  : {int(img_msk.sum().item()):,}')
+print(f'SBERT tensor       : {tuple(sbert_tensor.shape)}')
+print(f'Image tensor       : {tuple(img_3d.shape)}')
+print(f'Hotel mean         : {tuple(hotel_mean.shape)}')
+print(f'User visual        : {tuple(u_vis.shape)}')
+print(f'Graph              : {tuple(sparse_adj.shape)}')
+print('Negative sampling  : uniform unseen items (training cell)')
+print('=' * 100)
+
+del sbert_raw, sbert_mat, per_img, raw_user2idx, clean_splits
+gc.collect()
+torch.cuda.empty_cache()
+
+
+
+# %% PUBLIC NOTEBOOK CELL 3
+# ==============================================================================
+# CELL 3 — STRICT DATA / CATALOG / LEAKAGE / FEATURE AUDIT
+# ==============================================================================
+print('=' * 100)
+print('STRICT CANONICAL BENCHMARK AUDIT')
+print('=' * 100)
+
+# ------------------------------------------------------------------------------
+# 0. Invalid/anonymous-user cleaning audit
+# ------------------------------------------------------------------------------
+for name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    normalized = df['user_id'].astype(str).str.strip().str.lower()
+    invalid_left = normalized.isin(INVALID_USER_IDS)
+    assert not invalid_left.any(), f'Invalid/anonymous users remain in {name}'
+
+assert '/undefined' not in {u.lower() for u in user2idx.keys()}
+
+print(
+    '✅ Invalid/anonymous users removed before user mapping, graph, evidence, '
+    'and evaluation state.'
+)
+
+# ------------------------------------------------------------------------------
+# 1. Mapping bijection / contiguity
+# ------------------------------------------------------------------------------
+assert len(set(user2idx.values())) == num_users
+assert len(set(item2idx.values())) == num_items
+assert sorted(user2idx.values()) == list(range(num_users))
+assert sorted(item2idx.values()) == list(range(num_items))
+assert all(idx2user[i] in user2idx for i in range(num_users))
+assert all(idx2item[i] in item2idx for i in range(num_items))
+
+# ------------------------------------------------------------------------------
+# 2. Catalog <-> item map equality
+# ------------------------------------------------------------------------------
+assert 'img_hotel_id' in catalog_df.columns, catalog_df.columns.tolist()
+
+catalog_ids = set(
+    catalog_df['img_hotel_id'].astype(str).str.strip()
+)
+mapped_ids = set(item2idx.keys())
+
+assert catalog_df['img_hotel_id'].astype(str).str.strip().nunique() == len(catalog_df), (
+    'Duplicate img_hotel_id values exist in catalog_df'
+)
+assert len(catalog_ids) == num_items, (len(catalog_ids), num_items)
+
+if catalog_ids != mapped_ids:
+    raise RuntimeError(
+        'Catalog/item-map mismatch. '
+        f'catalog-only={sorted(catalog_ids - mapped_ids)[:10]}, '
+        f'map-only={sorted(mapped_ids - catalog_ids)[:10]}'
+    )
+
+print('✅ catalog_df and item2idx contain exactly the same 3,322 hotels.')
+
+# ------------------------------------------------------------------------------
+# 3. Split mapping coverage
+# ------------------------------------------------------------------------------
+for name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    assert df['user_id'].astype(str).map(user2idx).notna().all(), f'Unknown user in {name}'
+    assert df['img_hotel_id'].astype(str).map(item2idx).notna().all(), f'Unknown item in {name}'
+
+# ------------------------------------------------------------------------------
+# 4. Split pair disjointness and duplicate checks
+# ------------------------------------------------------------------------------
+for name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    dup = int(df.duplicated(['user_id', 'img_hotel_id']).sum())
+    assert dup == 0, f'{name} contains {dup} duplicate user-hotel pairs'
+
+train_pairs = set(zip(train_df['user_id'].astype(str), train_df['img_hotel_id'].astype(str)))
+val_pairs = set(zip(val_df['user_id'].astype(str), val_df['img_hotel_id'].astype(str)))
+test_pairs = set(zip(test_df['user_id'].astype(str), test_df['img_hotel_id'].astype(str)))
+
+assert not (train_pairs & val_pairs)
+assert not (train_pairs & test_pairs)
+assert not (val_pairs & test_pairs)
+
+# ------------------------------------------------------------------------------
+# 5. Cold-start checks relative to TRAIN
+# ------------------------------------------------------------------------------
+train_user_set = set(train_df['user_id'].astype(str))
+train_item_set = set(train_df['img_hotel_id'].astype(str))
+
+for name, df in [('val', val_df), ('test', test_df)]:
+    cold_u = set(df['user_id'].astype(str)) - train_user_set
+    cold_i = set(df['img_hotel_id'].astype(str)) - train_item_set
+    print(f'{name}: cold users={len(cold_u):,}, cold items={len(cold_i):,}')
+    assert len(cold_u) == 0, f'{name} has cold users'
+    assert len(cold_i) == 0, f'{name} has cold items'
+
+# ------------------------------------------------------------------------------
+# 6. Multi-positive evaluation audit
+# ------------------------------------------------------------------------------
+for name, df in [('val', val_df), ('test', test_df)]:
+    counts = df.groupby('user_id').size()
+    print(
+        f'{name}: interactions={len(df):,}, unique users={counts.size:,}, '
+        f'users with >1 target={int((counts > 1).sum()):,}, '
+        f'max targets/user={int(counts.max())}'
+    )
+
+    # No held-out target for a user may be in that user's TRAIN mask.
+    for user_key, group in df.groupby('user_id', sort=False):
+        uid = user2idx[str(user_key)]
+        heldout = {item2idx[str(x)] for x in group['img_hotel_id'].astype(str)}
+        train_seen = set(train_user_mask_dict.get(uid, []))
+        overlap = heldout & train_seen
+        assert not overlap, (
+            f'{name}: held-out target(s) also present in TRAIN for user {user_key}: '
+            f'{sorted(overlap)[:10]}'
+        )
+
+# ------------------------------------------------------------------------------
+# 7. Feature / graph numerical and dimensional checks
+# ------------------------------------------------------------------------------
+for name, tensor in [
+    ('SBERT', sbert_tensor),
+    ('IMG_3D', img_3d),
+    ('HOTEL_MEAN', hotel_mean),
+    ('U_VIS', u_vis),
+]:
+    assert torch.isfinite(tensor).all(), f'Non-finite values in {name}'
+
+assert tuple(sbert_tensor.shape) == (num_items, TEXT_DIM)
+assert tuple(img_3d.shape) == (num_items, MAX_IMAGES, IMAGE_DIM)
+assert tuple(img_msk.shape) == (num_items, MAX_IMAGES)
+assert tuple(hotel_mean.shape) == (num_items, IMAGE_DIM)
+assert tuple(u_vis.shape) == (num_users, IMAGE_DIM)
+assert sparse_adj.shape == (num_users + num_items, num_users + num_items)
+assert sparse_adj.is_coalesced()
+
+# Every mapped hotel has at least one visual image in this canonical benchmark.
+assert bool(img_msk.any(dim=1).all().item())
+
+# ------------------------------------------------------------------------------
+# 8. Persist an auditable benchmark summary
+# ------------------------------------------------------------------------------
+summary = {
+    'cleaning_removed_interactions': {k: int(v) for k, v in removed_counts.items()},
+    'users': int(num_users),
+    'items': int(num_items),
+    'train_interactions': int(len(train_df)),
+    'validation_interactions': int(len(val_df)),
+    'validation_users': int(val_df['user_id'].nunique()),
+    'test_interactions': int(len(test_df)),
+    'test_users': int(test_df['user_id'].nunique()),
+    'validation_users_with_multiple_targets': int((val_df.groupby('user_id').size() > 1).sum()),
+    'test_users_with_multiple_targets': int((test_df.groupby('user_id').size() > 1).sum()),
+    'valid_image_slots': int(img_msk.sum().item()),
+    'evaluation_unit': 'user',
+    'evaluation_relevance': 'all held-out hotels for that user in the evaluated split',
+}
+
+with open(os.path.join(ARTIFACT_DIR, 'canonical_benchmark_summary.json'), 'w') as f:
+    json.dump(summary, f, indent=2)
+
+print(json.dumps(summary, indent=2))
+print('✅ Strict canonical benchmark audit passed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 4
+# ==============================================================================
+# EVIDENCE-AWARE FEATURE CONSTRUCTION
+# ==============================================================================
+#
+# Purpose:
+#   Build train-safe evidence features that will be used by the proposed
+#   Evidence-Aware UVCRec model to decide how strongly visual information
+#   should be trusted.
+#
+# Evidence features:
+#
+#   USER-SIDE
+#       1. training interaction count
+#
+#   HOTEL-SIDE
+#       2. training interaction popularity
+#       3. visual availability (# valid images)
+#       4. visual coherence/reliability
+#
+# IMPORTANT:
+#   - User history uses TRAIN ONLY.
+#   - Hotel popularity uses TRAIN ONLY.
+#   - Visual features come only from the canonical V6 image tensors.
+#   - No test labels are used.
+#   - No model is trained here.
+#   - No checkpoint is modified.
+#
+# Proposed later gate:
+#
+#   g_ui = f(
+#       user_history,
+#       hotel_popularity,
+#       image_availability,
+#       visual_coherence
+#   )
+#
+# ==============================================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+
+print("=" * 100)
+print("EVIDENCE-AWARE FEATURE CONSTRUCTION")
+print("=" * 100)
+
+
+# ==============================================================================
+# 1. REQUIRED OBJECTS
+# ==============================================================================
+
+required_objects = [
+    "train_df",
+    "val_df",
+    "test_df",
+    "user2idx",
+    "item2idx",
+    "num_users",
+    "num_items",
+    "CANONICAL_IMG_3D",
+    "CANONICAL_IMG_MSK",
+    "ARTIFACT_DIR"
+]
+
+
+missing = [
+    name
+    for name in required_objects
+    if name not in globals()
+]
+
+
+if missing:
+
+    raise RuntimeError(
+        "Missing required V6 objects:\n"
+        +
+        "\n".join(
+            f"  - {name}"
+            for name in missing
+        )
+    )
+
+
+# ==============================================================================
+# 2. CANONICAL DIMENSION CHECKS
+# ==============================================================================
+
+assert num_items == 3322
+assert num_users == len(user2idx)
+assert num_users == train_df['user_id'].astype(str).nunique()
+
+assert (
+    CANONICAL_IMG_3D.ndim == 3
+)
+
+assert (
+    CANONICAL_IMG_MSK.ndim == 2
+)
+
+assert (
+    CANONICAL_IMG_3D.shape[0]
+    == num_items
+)
+
+assert (
+    CANONICAL_IMG_MSK.shape[0]
+    == num_items
+)
+
+assert (
+    CANONICAL_IMG_3D.shape[1]
+    == 32
+)
+
+assert (
+    CANONICAL_IMG_3D.shape[2]
+    == 512
+)
+
+
+# ==============================================================================
+# 3. TRAINING USER HISTORY DEPTH
+# ==============================================================================
+#
+# IMPORTANT:
+#   This is calculated ONLY from train_df.
+#
+# In your final V6 data, almost every user has exactly one training event.
+# That fact is a genuine characteristic of the experimental regime and is
+# therefore an appropriate evidence feature.
+# ==============================================================================
+
+train_user_keys = (
+    train_df["user_id"]
+    .astype(str)
+)
+
+
+user_history_count = np.zeros(
+    num_users,
+    dtype=np.float32
+)
+
+
+for user_key, count in (
+    train_user_keys.value_counts()
+    .items()
+):
+
+    if user_key not in user2idx:
+
+        raise RuntimeError(
+            f"Training user missing from user2idx: {user_key}"
+        )
+
+
+    uid = int(
+        user2idx[user_key]
+    )
+
+
+    user_history_count[
+        uid
+    ] = float(count)
+
+
+# Every canonical user should have at least one train interaction.
+assert (
+    user_history_count > 0
+).all()
+
+
+# Log transform + min-max normalization.
+# This maps the dominant one-interaction regime to 0 and the deepest history to 1.
+user_history_log = np.log1p(user_history_count).astype(np.float32)
+user_history_min = float(user_history_log.min())
+user_history_max = float(user_history_log.max())
+user_history_range = user_history_max - user_history_min
+
+if user_history_range > 1e-12:
+    user_history_feature = (
+        (user_history_log - user_history_min) / user_history_range
+    ).astype(np.float32)
+else:
+    user_history_feature = np.zeros(num_users, dtype=np.float32)
+
+
+# ==============================================================================
+# 4. TRAIN-ONLY HOTEL POPULARITY
+# ==============================================================================
+#
+# Popularity is the number of TRAIN interactions for each canonical hotel.
+# ==============================================================================
+
+hotel_popularity = np.zeros(
+    num_items,
+    dtype=np.float32
+)
+
+
+for hotel_key in (
+    train_df["img_hotel_id"]
+    .astype(str)
+):
+
+    if hotel_key not in item2idx:
+
+        raise RuntimeError(
+            f"Training hotel outside canonical catalog: {hotel_key}"
+        )
+
+
+    iid = int(
+        item2idx[hotel_key]
+    )
+
+
+    hotel_popularity[
+        iid
+    ] += 1.0
+
+
+# Log-transform to reduce skew, then min-max normalize over the canonical catalog.
+hotel_popularity_log = np.log1p(hotel_popularity).astype(np.float32)
+hotel_popularity_min = float(hotel_popularity_log.min())
+hotel_popularity_max = float(hotel_popularity_log.max())
+hotel_popularity_range = hotel_popularity_max - hotel_popularity_min
+
+if hotel_popularity_range > 1e-12:
+    hotel_popularity_feature = (
+        (hotel_popularity_log - hotel_popularity_min) / hotel_popularity_range
+    ).astype(np.float32)
+else:
+    hotel_popularity_feature = np.zeros(num_items, dtype=np.float32)
+
+
+# ==============================================================================
+# 5. VISUAL AVAILABILITY
+# ==============================================================================
+#
+# Number of valid canonical hotel images.
+# This is derived from the image mask and contains no recommendation labels.
+# ==============================================================================
+
+visual_count = (
+
+    CANONICAL_IMG_MSK
+    .detach()
+    .bool()
+    .sum(
+        dim=1
+    )
+    .cpu()
+    .numpy()
+    .astype(np.float32)
+
+)
+
+
+assert len(
+    visual_count
+) == num_items
+
+
+visual_availability_feature = (
+    visual_count
+    /
+    float(
+        CANONICAL_IMG_MSK.shape[1]
+    )
+)
+
+
+# ==============================================================================
+# 6. VISUAL COHERENCE / RELIABILITY
+# ==============================================================================
+#
+# For every hotel:
+#
+#   visual_coherence =
+#       mean pairwise cosine similarity among valid hotel images.
+#
+# Hotels with fewer than two images receive raw coherence 0 because internal
+# consistency cannot be estimated from a singleton image. Image availability is
+# retained as a separate evidence dimension.
+#
+# Interpretation:
+#
+#   Higher -> images for the hotel are visually more internally coherent.
+#   Lower  -> images are more heterogeneous.
+#
+# This is NOT a supervised quality score.
+# It is an unsupervised visual-consistency signal.
+#
+# ==============================================================================
+
+print(
+    "Computing visual coherence..."
+)
+
+
+img_cpu = (
+    CANONICAL_IMG_3D
+    .detach()
+    .float()
+    .cpu()
+)
+
+
+mask_cpu = (
+    CANONICAL_IMG_MSK
+    .detach()
+    .bool()
+    .cpu()
+)
+
+
+# Normalize image embeddings for cosine similarity.
+img_norm = F.normalize(
+    img_cpu,
+    p=2,
+    dim=-1
+)
+
+
+# Canonical hotel mean from your V6 pipeline.
+hotel_mean_cpu = (
+    F.normalize(
+        CANONICAL_HOTEL_MEAN
+        .detach()
+        .float()
+        .cpu(),
+        p=2,
+        dim=-1
+    )
+)
+
+
+visual_coherence = np.zeros(
+    num_items,
+    dtype=np.float32
+)
+
+
+for iid in range(
+    num_items
+):
+
+    valid = mask_cpu[iid]
+    count = int(valid.sum().item())
+
+    # Pairwise coherence is undefined for a singleton image set.
+    # Use 0.0 to represent "no internal-consistency evidence"; availability is
+    # modeled separately, so this does not pretend that one image is perfectly
+    # coherent with itself.
+    if count < 2:
+        visual_coherence[iid] = 0.0
+        continue
+
+    valid_images = img_norm[iid][valid]
+
+    # Images are already L2-normalized, so matrix multiplication is cosine sim.
+    similarity = valid_images @ valid_images.T
+    tri = torch.triu_indices(
+        count,
+        count,
+        offset=1
+    )
+    pairwise_scores = similarity[tri[0], tri[1]]
+
+    visual_coherence[iid] = float(
+        pairwise_scores.mean().item()
+    )
+
+
+# Numerical safety.
+visual_coherence = np.nan_to_num(
+    visual_coherence,
+    nan=0.0,
+    posinf=1.0,
+    neginf=0.0
+)
+
+
+# Empirical min-max normalization over the canonical item catalog.
+# Raw cosine coherence is already concentrated at high values, so (x+1)/2 would
+# compress almost every hotel near 1.0 and weaken this evidence dimension.
+coherence_min = float(visual_coherence.min())
+coherence_max = float(visual_coherence.max())
+coherence_range = coherence_max - coherence_min
+
+if coherence_range > 1e-12:
+    visual_coherence_feature = (
+        (visual_coherence - coherence_min) / coherence_range
+    ).astype(np.float32)
+else:
+    visual_coherence_feature = np.zeros(num_items, dtype=np.float32)
+
+visual_coherence_feature = np.clip(
+    visual_coherence_feature, 0.0, 1.0
+).astype(np.float32)
+
+
+# ==============================================================================
+# 7. CREATE CANONICAL USER / ITEM EVIDENCE MATRICES
+# ==============================================================================
+
+# User evidence:
+#
+#   column 0 = normalized log training-history depth
+#
+user_evidence = np.asarray(
+    user_history_feature,
+    dtype=np.float32
+).reshape(
+    num_users,
+    1
+)
+
+
+# Hotel evidence:
+#
+#   column 0 = normalized log popularity
+#   column 1 = normalized image availability
+#   column 2 = visual coherence
+#
+item_evidence = np.column_stack(
+    [
+        hotel_popularity_feature,
+        visual_availability_feature,
+        visual_coherence_feature
+    ]
+).astype(
+    np.float32
+)
+
+
+# ==============================================================================
+# 8. BASIC NUMERICAL CHECKS
+# ==============================================================================
+
+assert user_evidence.shape == (
+    num_users,
+    1
+)
+
+
+assert item_evidence.shape == (
+    num_items,
+    3
+)
+
+
+assert np.isfinite(
+    user_evidence
+).all()
+
+
+assert np.isfinite(
+    item_evidence
+).all()
+
+
+assert (
+    user_evidence.min()
+    >=
+    0.0
+)
+
+assert (
+    user_evidence.max()
+    <=
+    1.0
+)
+
+
+assert (
+    item_evidence[:, 0].min()
+    >=
+    0.0
+)
+
+assert (
+    item_evidence[:, 0].max()
+    <=
+    1.0
+)
+
+
+assert (
+    item_evidence[:, 1].min()
+    >=
+    0.0
+)
+
+assert (
+    item_evidence[:, 1].max()
+    <=
+    1.0
+)
+
+
+assert (
+    item_evidence[:, 2].min()
+    >=
+    0.0
+)
+
+assert (
+    item_evidence[:, 2].max()
+    <=
+    1.0
+)
+
+
+# ==============================================================================
+# 9. BUILD TRAIN / VALIDATION / TEST ITEM EVIDENCE TABLE
+# ==============================================================================
+#
+# This is only for inspection and later analysis.
+# ==============================================================================
+
+def attach_item_evidence(
+    df,
+    dataframe_name
+):
+
+    out = df.copy()
+
+
+    item_ids = (
+        out["img_hotel_id"]
+        .astype(str)
+        .map(item2idx)
+    )
+
+
+    if item_ids.isna().any():
+
+        bad = (
+            out.loc[
+                item_ids.isna(),
+                "img_hotel_id"
+            ]
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+
+        raise RuntimeError(
+            f"{dataframe_name} contains hotel IDs outside canonical catalog: "
+            f"{bad[:10]}"
+        )
+
+
+    item_ids = item_ids.astype(
+        np.int64
+    )
+
+
+    out[
+        "train_popularity"
+    ] = hotel_popularity[
+        item_ids.to_numpy()
+    ]
+
+
+    out[
+        "visual_image_count"
+    ] = visual_count[
+        item_ids.to_numpy()
+    ]
+
+
+    out[
+        "visual_availability"
+    ] = visual_availability_feature[
+        item_ids.to_numpy()
+    ]
+
+
+    out[
+        "visual_coherence"
+    ] = visual_coherence_feature[
+        item_ids.to_numpy()
+    ]
+
+
+    return out
+
+
+train_evidence_df = attach_item_evidence(
+    train_df,
+    "train_df"
+)
+
+
+val_evidence_df = attach_item_evidence(
+    val_df,
+    "val_df"
+)
+
+
+test_evidence_df = attach_item_evidence(
+    test_df,
+    "test_df"
+)
+
+
+# ==============================================================================
+# 10. USER EVIDENCE FOR SPLITS
+# ==============================================================================
+
+def attach_user_history(
+    df
+):
+
+    out = df.copy()
+
+
+    user_ids = (
+        out["user_id"]
+        .astype(str)
+        .map(user2idx)
+    )
+
+
+    if user_ids.isna().any():
+
+        bad = (
+            out.loc[
+                user_ids.isna(),
+                "user_id"
+            ]
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+
+
+        raise RuntimeError(
+            f"Unknown users found: {bad[:10]}"
+        )
+
+
+    user_ids = user_ids.astype(
+        np.int64
+    )
+
+
+    out[
+        "train_user_history"
+    ] = user_history_count[
+        user_ids.to_numpy()
+    ]
+
+
+    out[
+        "train_user_history_norm"
+    ] = user_history_feature[
+        user_ids.to_numpy()
+    ]
+
+
+    return out
+
+
+train_evidence_df = attach_user_history(
+    train_evidence_df
+)
+
+
+val_evidence_df = attach_user_history(
+    val_evidence_df
+)
+
+
+test_evidence_df = attach_user_history(
+    test_evidence_df
+)
+
+
+# ==============================================================================
+# 11. CLEAN VALIDATION / TEST EVIDENCE SANITY
+# ==============================================================================
+# Never hard-code historical V6 row/user counts here.  The journal benchmark is
+# cleaned before evidence construction, so these checks are tied directly to the
+# current cleaned dataframes.
+
+assert len(val_evidence_df) == len(val_df), (
+    f"Validation evidence row mismatch: {len(val_evidence_df)} vs {len(val_df)}"
+)
+
+assert len(test_evidence_df) == len(test_df), (
+    f"Test evidence row mismatch: {len(test_evidence_df)} vs {len(test_df)}"
+)
+
+assert (
+    val_evidence_df["user_id"].astype(str).nunique()
+    == val_df["user_id"].astype(str).nunique()
+), "Validation evidence user-count mismatch"
+
+assert (
+    test_evidence_df["user_id"].astype(str).nunique()
+    == test_df["user_id"].astype(str).nunique()
+), "Test evidence user-count mismatch"
+
+# Every evaluation user must have at least one TRAIN interaction; otherwise
+# user-side evidence and graph representations would be undefined/cold-start.
+assert (val_evidence_df["train_user_history"] >= 1).all()
+assert (test_evidence_df["train_user_history"] >= 1).all()
+
+# The cleaned V7 benchmark currently has one held-out hotel per evaluation user.
+# Keep this as an explicit data-integrity check while the evaluator itself remains
+# valid for the more general multi-positive case.
+assert len(val_df) == val_df["user_id"].astype(str).nunique()
+assert len(test_df) == test_df["user_id"].astype(str).nunique()
+
+print(
+    f"✅ Clean evidence alignment passed: "
+    f"val={len(val_evidence_df):,} rows / "
+    f"{val_evidence_df['user_id'].astype(str).nunique():,} users; "
+    f"test={len(test_evidence_df):,} rows / "
+    f"{test_evidence_df['user_id'].astype(str).nunique():,} users."
+)
+
+
+# ==============================================================================
+# 12. PRINT EVIDENCE SUMMARY
+# ==============================================================================
+
+print("\n")
+print("=" * 100)
+print("EVIDENCE FEATURE SUMMARY")
+print("=" * 100)
+
+
+print(
+    f"User evidence shape : "
+    f"{user_evidence.shape}"
+)
+
+
+print(
+    f"Item evidence shape : "
+    f"{item_evidence.shape}"
+)
+
+
+print(
+    "\nUSER-SIDE"
+)
+
+
+print(
+    f"Training history min  : "
+    f"{user_history_count.min():.0f}"
+)
+
+
+print(
+    f"Training history median: "
+    f"{np.median(user_history_count):.1f}"
+)
+
+
+print(
+    f"Training history mean  : "
+    f"{user_history_count.mean():.6f}"
+)
+
+
+print(
+    f"Training history max   : "
+    f"{user_history_count.max():.0f}"
+)
+
+
+print(
+    "\nITEM-SIDE"
+)
+
+
+print(
+    f"Popularity min         : "
+    f"{hotel_popularity.min():.0f}"
+)
+
+
+print(
+    f"Popularity median      : "
+    f"{np.median(hotel_popularity):.1f}"
+)
+
+
+print(
+    f"Popularity max         : "
+    f"{hotel_popularity.max():.0f}"
+)
+
+
+print(
+    f"Image count min        : "
+    f"{visual_count.min():.0f}"
+)
+
+
+print(
+    f"Image count median     : "
+    f"{np.median(visual_count):.1f}"
+)
+
+
+print(
+    f"Image count max        : "
+    f"{visual_count.max():.0f}"
+)
+
+
+print(
+    f"Visual coherence min   : "
+    f"{visual_coherence.min():.4f}"
+)
+
+
+print(
+    f"Visual coherence mean  : "
+    f"{visual_coherence.mean():.4f}"
+)
+
+
+print(
+    f"Visual coherence max   : "
+    f"{visual_coherence.max():.4f}"
+)
+
+
+# ==============================================================================
+# 13. CHECK EXTREME SPARSITY
+# ==============================================================================
+
+exactly_one_users = int(
+    np.sum(
+        user_history_count
+        ==
+        1
+    )
+)
+
+
+two_plus_users = int(
+    np.sum(
+        user_history_count
+        >=
+        2
+    )
+)
+
+
+print("\n")
+print("=" * 100)
+print("USER SPARSITY CHECK")
+print("=" * 100)
+
+
+print(
+    f"Exactly 1 train interaction : "
+    f"{exactly_one_users:,} "
+    f"({100.0 * exactly_one_users / num_users:.4f}%)"
+)
+
+
+print(
+    f"2+ train interactions       : "
+    f"{two_plus_users:,} "
+    f"({100.0 * two_plus_users / num_users:.4f}%)"
+)
+
+
+# ==============================================================================
+# 14. CREATE TENSOR VERSIONS
+# ==============================================================================
+#
+# These are the tensors that Cell 20 will consume.
+# ==============================================================================
+
+USER_EVIDENCE = torch.tensor(
+    user_evidence,
+    dtype=torch.float32,
+    device=DEVICE
+)
+
+
+ITEM_EVIDENCE = torch.tensor(
+    item_evidence,
+    dtype=torch.float32,
+    device=DEVICE
+)
+
+
+assert USER_EVIDENCE.shape == (
+    num_users,
+    1
+)
+
+
+assert ITEM_EVIDENCE.shape == (
+    num_items,
+    3
+)
+
+
+assert torch.isfinite(
+    USER_EVIDENCE
+).all()
+
+
+assert torch.isfinite(
+    ITEM_EVIDENCE
+).all()
+
+
+print("\n")
+print("=" * 100)
+print("EVIDENCE TENSORS")
+print("=" * 100)
+
+
+print(
+    f"USER_EVIDENCE : "
+    f"{tuple(USER_EVIDENCE.shape)}"
+)
+
+
+print(
+    f"ITEM_EVIDENCE : "
+    f"{tuple(ITEM_EVIDENCE.shape)}"
+)
+
+
+# ==============================================================================
+# 15. SAVE EVIDENCE FEATURES
+# ==============================================================================
+
+evidence_json = os.path.join(
+    ARTIFACT_DIR,
+    "clean_final_evidence_features.json"
+)
+
+
+evidence_csv = os.path.join(
+    ARTIFACT_DIR,
+    "clean_final_evidence_item_features.csv"
+)
+
+
+evidence_payload = {
+
+    "experiment":
+        "Evidence-aware multimodal feature construction",
+
+    "catalog_items":
+        int(num_items),
+
+    "users":
+        int(num_users),
+
+    "user_features": [
+        "train_user_history_norm"
+    ],
+
+    "item_features": [
+        "train_popularity_norm",
+        "visual_availability",
+        "visual_coherence"
+    ],
+
+    "user_history": {
+
+        "exactly_one":
+            exactly_one_users,
+
+        "two_or_more":
+            two_plus_users,
+
+        "mean":
+            float(user_history_count.mean()),
+
+        "median":
+            float(np.median(user_history_count)),
+
+        "maximum":
+            int(user_history_count.max())
+
+    },
+
+    "item_statistics": {
+
+        "popularity_min":
+            int(hotel_popularity.min()),
+
+        "popularity_median":
+            float(np.median(hotel_popularity)),
+
+        "popularity_max":
+            int(hotel_popularity.max()),
+
+        "image_count_min":
+            int(visual_count.min()),
+
+        "image_count_median":
+            float(np.median(visual_count)),
+
+        "image_count_max":
+            int(visual_count.max()),
+
+        "visual_coherence_mean":
+            float(visual_coherence.mean())
+
+    }
+
+}
+
+
+with open(
+    evidence_json,
+    "w"
+) as f:
+
+    json.dump(
+        evidence_payload,
+        f,
+        indent=2
+    )
+
+
+# Save one row per canonical hotel.
+item_feature_df = pd.DataFrame({
+
+    "item_index":
+        np.arange(
+            num_items,
+            dtype=np.int64
+        ),
+
+    "train_popularity":
+        hotel_popularity.astype(
+            np.int64
+        ),
+
+    "train_popularity_norm":
+        hotel_popularity_feature,
+
+    "visual_image_count":
+        visual_count.astype(
+            np.int64
+        ),
+
+    "visual_availability":
+        visual_availability_feature,
+
+    "visual_coherence":
+        visual_coherence_feature
+
+})
+
+
+item_feature_df.to_csv(
+    evidence_csv,
+    index=False
+)
+
+
+print("\n")
+print("=" * 100)
+print("✅ CELL 19 COMPLETE")
+print("=" * 100)
+
+print(
+    f"JSON : {evidence_json}"
+)
+
+print(
+    f"CSV  : {evidence_csv}"
+)
+
+print(
+    "\nNo model was trained."
+)
+
+print(
+    "No checkpoint was modified."
+)
+
+print("=" * 100)
+
+
+# ==============================================================================
+# 16. NORMALIZED EVIDENCE RANGE CHECK
+# ==============================================================================
+print("=" * 100)
+print("NORMALIZED EVIDENCE RANGE CHECK")
+print("=" * 100)
+print(
+    f"User history evidence  : min={USER_EVIDENCE[:, 0].min().item():.6f}, "
+    f"mean={USER_EVIDENCE[:, 0].mean().item():.6f}, "
+    f"max={USER_EVIDENCE[:, 0].max().item():.6f}"
+)
+print(
+    f"Hotel popularity       : min={ITEM_EVIDENCE[:, 0].min().item():.6f}, "
+    f"mean={ITEM_EVIDENCE[:, 0].mean().item():.6f}, "
+    f"max={ITEM_EVIDENCE[:, 0].max().item():.6f}"
+)
+print(
+    f"Image availability     : min={ITEM_EVIDENCE[:, 1].min().item():.6f}, "
+    f"mean={ITEM_EVIDENCE[:, 1].mean().item():.6f}, "
+    f"max={ITEM_EVIDENCE[:, 1].max().item():.6f}"
+)
+print(
+    f"Visual coherence       : min={ITEM_EVIDENCE[:, 2].min().item():.6f}, "
+    f"mean={ITEM_EVIDENCE[:, 2].mean().item():.6f}, "
+    f"max={ITEM_EVIDENCE[:, 2].max().item():.6f}"
+)
+assert torch.isfinite(USER_EVIDENCE).all()
+assert torch.isfinite(ITEM_EVIDENCE).all()
+assert 0.0 <= float(USER_EVIDENCE.min()) <= float(USER_EVIDENCE.max()) <= 1.0
+assert 0.0 <= float(ITEM_EVIDENCE.min()) <= float(ITEM_EVIDENCE.max()) <= 1.0
+print("✅ All normalized evidence features are finite and within [0, 1].")
+print("=" * 100)
+
+
+
+# %% PUBLIC NOTEBOOK CELL 5
+# ==============================================================================
+# CELL 5 — CANONICAL USER-LEVEL, MULTI-POSITIVE FULL-CATALOG EVALUATION
+# ==============================================================================
+# Evaluation unit: USER, not interaction.
+# Relevance for a user: every held-out hotel belonging to that user in eval_df.
+# Training-observed hotels are masked. Other held-out positives are NOT masked.
+# ==============================================================================
+
+
+def build_eval_user_targets(eval_df):
+    """Return ordered user IDs and all held-out relevant item indices per user."""
+    required = {'user_id', 'img_hotel_id'}
+    missing = required - set(eval_df.columns)
+    if missing:
+        raise ValueError(f'eval_df missing columns: {sorted(missing)}')
+
+    users = []
+    relevant_sets = []
+
+    for user_key, group in eval_df.groupby('user_id', sort=False):
+        user_key = str(user_key)
+        if user_key not in user2idx:
+            raise KeyError(f'Unknown evaluation user: {user_key}')
+
+        relevant = sorted({
+            item2idx[str(x)]
+            for x in group['img_hotel_id'].astype(str)
+        })
+
+        if not relevant:
+            raise RuntimeError(f'No relevant items for evaluation user {user_key}')
+
+        train_seen = set(train_user_mask_dict.get(user2idx[user_key], []))
+        overlap = train_seen.intersection(relevant)
+        if overlap:
+            raise RuntimeError(
+                f'Held-out relevant item(s) also in TRAIN for user {user_key}: '
+                f'{sorted(overlap)[:10]}'
+            )
+
+        users.append(user_key)
+        relevant_sets.append(set(relevant))
+
+    return users, relevant_sets
+
+
+def metrics_from_ranked_items(ranked_items, relevant_items):
+    """Binary-relevance HR/NDCG@10,@20 and MRR@20 for one user."""
+    ranked_items = [int(x) for x in ranked_items]
+    relevant_items = set(int(x) for x in relevant_items)
+
+    if not relevant_items:
+        raise ValueError('relevant_items must be non-empty')
+
+    result = {}
+
+    for k in (10, 20):
+        topk = ranked_items[:k]
+        hit_positions = [
+            rank
+            for rank, item in enumerate(topk)
+            if item in relevant_items
+        ]
+
+        result[f'HR@{k}'] = float(len(hit_positions) > 0)
+
+        dcg = sum(
+            1.0 / np.log2(rank + 2.0)
+            for rank in hit_positions
+        )
+
+        ideal_hits = min(len(relevant_items), k)
+        idcg = sum(
+            1.0 / np.log2(rank + 2.0)
+            for rank in range(ideal_hits)
+        )
+
+        result[f'NDCG@{k}'] = float(dcg / idcg) if idcg > 0 else 0.0
+
+    first_hit = next(
+        (
+            rank
+            for rank, item in enumerate(ranked_items[:20])
+            if item in relevant_items
+        ),
+        None
+    )
+    result['MRR@20'] = 0.0 if first_hit is None else float(1.0 / (first_hit + 1))
+
+    return result
+
+
+def evaluate_model_user_metrics(model, eval_df, batch_size=TEST_BATCH_SIZE):
+    """Return one metric row per unique evaluation user."""
+    model.eval()
+    user_keys, relevant_sets = build_eval_user_targets(eval_df)
+    records = []
+
+    with torch.no_grad():
+        for start in range(0, len(user_keys), batch_size):
+            end = min(start + batch_size, len(user_keys))
+            batch_users = user_keys[start:end]
+            batch_relevant = relevant_sets[start:end]
+
+            uidx = torch.tensor(
+                [user2idx[u] for u in batch_users],
+                dtype=torch.long,
+                device=DEVICE
+            )
+
+            scores = model.score_batch(uidx).float().clone()
+            if scores.shape != (len(batch_users), num_items):
+                raise RuntimeError(
+                    f'Unexpected score shape {tuple(scores.shape)}; '
+                    f'expected {(len(batch_users), num_items)}'
+                )
+            if not torch.isfinite(scores).all():
+                raise RuntimeError('Non-finite model scores during evaluation')
+
+            # Mask TRAIN history only.
+            for row, user_key in enumerate(batch_users):
+                seen = train_user_mask_dict.get(user2idx[user_key], [])
+                if seen:
+                    scores[row, seen] = -1e9
+
+            top20 = torch.topk(
+                scores,
+                k=min(20, num_items),
+                dim=1
+            ).indices.detach().cpu().numpy()
+
+            for row, user_key in enumerate(batch_users):
+                metrics = metrics_from_ranked_items(
+                    top20[row],
+                    batch_relevant[row]
+                )
+                records.append({
+                    'user_id': user_key,
+                    'n_relevant': int(len(batch_relevant[row])),
+                    **metrics,
+                })
+
+    out = pd.DataFrame(records)
+    if len(out) != len(user_keys):
+        raise RuntimeError((len(out), len(user_keys)))
+    if out['user_id'].duplicated().any():
+        raise RuntimeError('User-level evaluator produced duplicate user rows')
+
+    return out
+
+
+def evaluate_model_v6(model, eval_df, batch_size=TEST_BATCH_SIZE):
+    """Canonical aggregate evaluator: macro-average over unique users."""
+    per_user = evaluate_model_user_metrics(
+        model,
+        eval_df,
+        batch_size=batch_size
+    )
+
+    metrics = ['HR@10', 'HR@20', 'NDCG@10', 'NDCG@20', 'MRR@20']
+    return {
+        metric: float(per_user[metric].mean())
+        for metric in metrics
+    }
+
+
+def summarize_three_seed_runs(runs):
+    out = {}
+
+    for metric in [
+        'HR@10', 'HR@20',
+        'NDCG@10', 'NDCG@20',
+        'MRR@20'
+    ]:
+        values = np.asarray(
+            [r[metric] for r in runs],
+            dtype=float
+        )
+
+        out[metric] = {
+            'mean': float(values.mean()),
+            'sd': float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+            'seed_values': [float(x) for x in values]
+        }
+
+    return out
+
+
+print('✅ Canonical user-level multi-positive full-catalog evaluator ready.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 6
+# ==============================================================================
+# CELL 6 — USER-LEVEL EVALUATION HELPERS + MOST-POPULAR BASELINE
+# ==============================================================================
+
+
+def evaluate_user_ndcg20(model, eval_df, batch_size=TEST_BATCH_SIZE):
+    """Return exactly one NDCG@20 value per unique evaluation user."""
+    per_user = evaluate_model_user_metrics(
+        model,
+        eval_df,
+        batch_size=batch_size
+    )
+    return per_user.set_index('user_id')['NDCG@20'].sort_index()
+
+
+def popularity_user_metrics(eval_df):
+    """User-level full-catalog evaluation of TRAIN-only Most-Popular."""
+    popularity = np.zeros(num_items, dtype=np.float64)
+    for item_key in train_df['img_hotel_id'].astype(str):
+        popularity[item2idx[item_key]] += 1.0
+
+    user_keys, relevant_sets = build_eval_user_targets(eval_df)
+    records = []
+
+    for user_key, relevant in zip(user_keys, relevant_sets):
+        uid = user2idx[user_key]
+        scores = popularity.copy()
+
+        seen = train_user_mask_dict.get(uid, [])
+        if seen:
+            scores[np.asarray(seen, dtype=np.int64)] = -np.inf
+
+        k = min(20, num_items)
+        candidate = np.argpartition(-scores, k - 1)[:k]
+        ranked = candidate[np.argsort(-scores[candidate])]
+
+        metrics = metrics_from_ranked_items(ranked, relevant)
+        records.append({
+            'user_id': user_key,
+            'n_relevant': int(len(relevant)),
+            **metrics,
+        })
+
+    out = pd.DataFrame(records)
+    assert len(out) == len(user_keys)
+    assert not out['user_id'].duplicated().any()
+    return out
+
+
+def evaluate_popularity_v6(eval_df):
+    per_user = popularity_user_metrics(eval_df)
+    metrics = ['HR@10', 'HR@20', 'NDCG@10', 'NDCG@20', 'MRR@20']
+    return {
+        metric: float(per_user[metric].mean())
+        for metric in metrics
+    }
+
+
+print('✅ User-level evaluation helpers ready.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 7
+# ==============================================================================
+# CELL 7 — ID/TEXT BASELINES
+# ==============================================================================
+
+class LightGCNOnly(
+    nn.Module
+):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.ue = nn.Embedding(
+            num_users,
+            EMBED_DIM
+        )
+
+        self.ie = nn.Embedding(
+            num_items,
+            EMBED_DIM
+        )
+
+
+        nn.init.normal_(
+            self.ue.weight,
+            std=0.01
+        )
+
+        nn.init.normal_(
+            self.ie.weight,
+            std=0.01
+        )
+
+
+    def gcn(self):
+
+        e = torch.cat(
+            [
+                self.ue.weight,
+                self.ie.weight
+            ],
+            dim=0
+        )
+
+        outputs = [
+            e
+        ]
+
+
+        for _ in range(
+            K_LAYERS
+        ):
+
+            e = torch.sparse.mm(
+                sparse_adj,
+                e
+            )
+
+            outputs.append(
+                e
+            )
+
+
+        e = torch.stack(
+            outputs,
+            dim=1
+        ).mean(
+            dim=1
+        )
+
+
+        return torch.split(
+            e,
+            [
+                num_users,
+                num_items
+            ],
+            dim=0
+        )
+
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        u_g, i_g = self.gcn()
+
+        return (
+            u_g[
+                users
+            ]
+            @
+            i_g.T
+        )
+
+
+
+# ==============================================================================
+# CELL 5 — EXACT V6 TEXT-ONLY BASELINE
+# ==============================================================================
+
+class TextOnly(
+    nn.Module
+):
+
+    def __init__(
+        self
+    ):
+
+        super().__init__()
+
+
+        self.ue = nn.Embedding(
+            num_users,
+            EMBED_DIM
+        )
+
+
+        self.ie = nn.Embedding(
+            num_items,
+            EMBED_DIM
+        )
+
+
+        nn.init.normal_(
+            self.ue.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.ie.weight,
+            std=0.01
+        )
+
+
+        self.proj_t = nn.Linear(
+            TEXT_DIM,
+            EMBED_DIM
+        )
+
+
+    def gcn(
+        self
+    ):
+
+        e = torch.cat(
+            [
+                self.ue.weight,
+                self.ie.weight
+            ],
+            dim=0
+        )
+
+
+        outs = [
+            e
+        ]
+
+
+        for _ in range(
+            K_LAYERS
+        ):
+
+            e = torch.sparse.mm(
+                sparse_adj,
+                e
+            )
+
+            outs.append(
+                e
+            )
+
+
+        e = torch.stack(
+            outs,
+            dim=1
+        ).mean(
+            1
+        )
+
+
+        return torch.split(
+            e,
+            [
+                num_users,
+                num_items
+            ],
+            dim=0
+        )
+
+
+    def item_base(
+        self,
+        i_g
+    ):
+
+        return (
+            i_g
+            +
+            self.proj_t(
+                sbert_tensor
+            )
+        )
+
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        u_g, i_g = self.gcn()
+
+
+        return (
+            u_g[
+                users
+            ]
+            @
+            self.item_base(
+                i_g
+            ).T
+        )
+
+print('✅ TextOnly definition loaded.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 8
+# ==============================================================================
+# CELL 8 — VBPR / MMGCN / BM3 DEFINITIONS
+# ==============================================================================
+# These are the same compact V6 re-implementations used for the saved baseline
+# checkpoints. They are not silently replaced by different architectures.
+# ==============================================================================
+
+D = EMBED_DIM
+
+class VBPR(nn.Module):
+
+    def __init__(
+        self,
+        vis_dim=IMAGE_DIM,
+        d=D,
+        dv=D
+    ):
+
+        super().__init__()
+
+
+        self.gamma_u = nn.Embedding(
+            num_users,
+            d
+        )
+
+
+        self.gamma_i = nn.Embedding(
+            num_items,
+            d
+        )
+
+
+        self.theta_u = nn.Embedding(
+            num_users,
+            dv
+        )
+
+
+        self.E = nn.Linear(
+            vis_dim,
+            dv,
+            bias=False
+        )
+
+
+        self.beta_i = nn.Embedding(
+            num_items,
+            1
+        )
+
+
+        self.vbias = nn.Linear(
+            vis_dim,
+            1,
+            bias=False
+        )
+
+
+        nn.init.normal_(
+            self.gamma_u.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.gamma_i.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.theta_u.weight,
+            std=0.01
+        )
+
+
+        nn.init.zeros_(
+            self.beta_i.weight
+        )
+
+
+        self.register_buffer(
+            "vfeat",
+            hotel_mean.detach().clone()
+        )
+
+
+    def _item_vis(
+        self
+    ):
+
+        return self.E(
+            self.vfeat
+        )
+
+
+    def _vbias_all(
+        self
+    ):
+
+        return self.vbias(
+            self.vfeat
+        ).squeeze(-1)
+
+
+    def bpr_forward(
+        self,
+        users,
+        pos,
+        neg
+    ):
+
+        gu = self.gamma_u(
+            users
+        )
+
+
+        tu = self.theta_u(
+            users
+        )
+
+
+        Ef = self._item_vis()
+
+
+        vb = self._vbias_all()
+
+
+        bi = self.beta_i.weight.squeeze(
+            -1
+        )
+
+
+        def score(
+            items
+        ):
+
+            return (
+                (
+                    gu
+                    *
+                    self.gamma_i(
+                        items
+                    )
+                ).sum(-1)
+
+                +
+
+                (
+                    tu
+                    *
+                    Ef[
+                        items
+                    ]
+                ).sum(-1)
+
+                +
+
+                bi[
+                    items
+                ]
+
+                +
+
+                vb[
+                    items
+                ]
+            )
+
+
+        return (
+            score(pos),
+            score(neg)
+        )
+
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        gu = self.gamma_u(
+            users
+        )
+
+
+        tu = self.theta_u(
+            users
+        )
+
+
+        Ef = self._item_vis()
+
+
+        vb = self._vbias_all()
+
+
+        bi = self.beta_i.weight.squeeze(
+            -1
+        )
+
+
+        return (
+            gu
+            @
+            self.gamma_i.weight.T
+
+            +
+
+            tu
+            @
+            Ef.T
+
+            +
+
+            bi.unsqueeze(
+                0
+            )
+
+            +
+
+            vb.unsqueeze(
+                0
+            )
+        )
+
+class MMGCN(nn.Module):
+
+    def __init__(
+        self,
+        d=D
+    ):
+
+        super().__init__()
+
+
+        self.mods = [
+            "text",
+            "visual"
+        ]
+
+
+        self.uemb = nn.ModuleDict({
+
+            m:
+                nn.Embedding(
+                    num_users,
+                    d
+                )
+
+            for m in self.mods
+        })
+
+
+        self.iemb = nn.ModuleDict({
+
+            m:
+                nn.Embedding(
+                    num_items,
+                    d
+                )
+
+            for m in self.mods
+        })
+
+
+        self.proj = nn.ModuleDict({
+
+            "text":
+                nn.Linear(
+                    TEXT_DIM,
+                    d
+                ),
+
+            "visual":
+                nn.Linear(
+                    IMAGE_DIM,
+                    d
+                )
+        })
+
+
+        for m in self.mods:
+
+            nn.init.normal_(
+                self.uemb[m].weight,
+                std=0.01
+            )
+
+
+            nn.init.normal_(
+                self.iemb[m].weight,
+                std=0.01
+            )
+
+
+        self.register_buffer(
+            "tfeat",
+            sbert_tensor.detach().clone()
+        )
+
+
+        self.register_buffer(
+            "vfeat",
+            hotel_mean.detach().clone()
+        )
+
+
+    def _prop(
+        self,
+        modality
+    ):
+
+        feat = (
+            self.tfeat
+            if modality == "text"
+            else self.vfeat
+        )
+
+
+        item_input = (
+            self.iemb[
+                modality
+            ].weight
+
+            +
+
+            self.proj[
+                modality
+            ](
+                feat
+            )
+        )
+
+
+        e = torch.cat(
+            [
+                self.uemb[
+                    modality
+                ].weight,
+
+                item_input
+            ],
+            dim=0
+        )
+
+
+        outputs = [
+            e
+        ]
+
+
+        for _ in range(
+            K_LAYERS
+        ):
+
+            e = torch.sparse.mm(
+                sparse_adj,
+                e
+            )
+
+
+            outputs.append(
+                e
+            )
+
+
+        e = torch.stack(
+            outputs,
+            dim=1
+        ).mean(
+            dim=1
+        )
+
+
+        return torch.split(
+            e,
+            [
+                num_users,
+                num_items
+            ],
+            dim=0
+        )
+
+
+    def _all(
+        self
+    ):
+
+        U = {}
+
+        I = {}
+
+
+        for modality in self.mods:
+
+            u, i = self._prop(
+                modality
+            )
+
+
+            U[
+                modality
+            ] = u
+
+
+            I[
+                modality
+            ] = i
+
+
+        return (
+            U,
+            I
+        )
+
+
+    def bpr_forward(
+        self,
+        users,
+        pos,
+        neg
+    ):
+
+        U, I = self._all()
+
+
+        positive_score = sum(
+
+            (
+                U[m][users]
+                *
+                I[m][pos]
+            ).sum(
+                -1
+            )
+
+            for m in self.mods
+        )
+
+
+        negative_score = sum(
+
+            (
+                U[m][users]
+                *
+                I[m][neg]
+            ).sum(
+                -1
+            )
+
+            for m in self.mods
+        )
+
+
+        return (
+            positive_score,
+            negative_score
+        )
+
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        U, I = self._all()
+
+
+        return sum(
+
+            U[m][users]
+            @
+            I[m].T
+
+            for m in self.mods
+        )
+
+class BM3(nn.Module):
+
+    def __init__(
+        self,
+        d=D,
+        drop=0.3
+    ):
+
+        super().__init__()
+
+
+        self.ue = nn.Embedding(
+            num_users,
+            d
+        )
+
+
+        self.ie = nn.Embedding(
+            num_items,
+            d
+        )
+
+
+        nn.init.xavier_normal_(
+            self.ue.weight
+        )
+
+
+        nn.init.xavier_normal_(
+            self.ie.weight
+        )
+
+
+        self.proj_t = nn.Linear(
+            TEXT_DIM,
+            d
+        )
+
+
+        self.proj_v = nn.Linear(
+            IMAGE_DIM,
+            d
+        )
+
+
+        self.predictor = nn.Linear(
+            d,
+            d
+        )
+
+
+        self.drop_rate = drop
+
+
+        self.register_buffer(
+            "tfeat",
+            sbert_tensor.detach().clone()
+        )
+
+
+        self.register_buffer(
+            "vfeat",
+            hotel_mean.detach().clone()
+        )
+
+
+    def gcn(
+        self
+    ):
+
+        e = torch.cat(
+            [
+                self.ue.weight,
+                self.ie.weight
+            ],
+            dim=0
+        )
+
+
+        outputs = [
+            e
+        ]
+
+
+        for _ in range(
+            K_LAYERS
+        ):
+
+            e = torch.sparse.mm(
+                sparse_adj,
+                e
+            )
+
+
+            outputs.append(
+                e
+            )
+
+
+        e = torch.stack(
+            outputs,
+            dim=1
+        ).mean(
+            dim=1
+        )
+
+
+        return torch.split(
+            e,
+            [
+                num_users,
+                num_items
+            ],
+            dim=0
+        )
+
+
+    def item_multimodal(
+        self
+    ):
+
+        return (
+            self.proj_t(
+                self.tfeat
+            )
+
+            +
+
+            self.proj_v(
+                self.vfeat
+            )
+        )
+
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        u_g, i_g = self.gcn()
+
+
+        item_representation = (
+            i_g
+            +
+            self.item_multimodal()
+        )
+
+
+        return (
+            u_g[
+                users
+            ]
+            @
+            item_representation.T
+        )
+
+
+    def ssl_loss(
+        self,
+        users,
+        items
+    ):
+
+        u_g, i_g = self.gcn()
+
+
+        def cosine_distance(
+            a,
+            b
+        ):
+
+            return (
+                1.0
+                -
+                F.cosine_similarity(
+                    a,
+                    b,
+                    dim=-1
+                )
+            ).mean()
+
+
+        u_on = self.predictor(
+            u_g[
+                users
+            ]
+        )
+
+
+        i_on = self.predictor(
+            i_g[
+                items
+            ]
+        )
+
+
+        u_target = F.dropout(
+            u_g[
+                users
+            ],
+            self.drop_rate
+        ).detach()
+
+
+        i_target = F.dropout(
+            i_g[
+                items
+            ],
+            self.drop_rate
+        ).detach()
+
+
+        # Graph reconstruction
+        loss = (
+            cosine_distance(
+                u_on,
+                i_target
+            )
+
+            +
+
+            cosine_distance(
+                i_on,
+                u_target
+            )
+        )
+
+
+        # Modality-to-ID alignment
+        text_item = self.proj_t(
+            self.tfeat
+        )[items]
+
+
+        visual_item = self.proj_v(
+            self.vfeat
+        )[items]
+
+
+        loss = (
+            loss
+
+            +
+
+            cosine_distance(
+                text_item,
+                i_g[
+                    items
+                ].detach()
+            )
+
+            +
+
+            cosine_distance(
+                visual_item,
+                i_g[
+                    items
+                ].detach()
+            )
+        )
+
+
+        return loss
+
+print('✅ VBPR / MMGCN / BM3 definitions loaded.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 9
+# ==============================================================================
+# CELL 9 — UVCRec-MG-Attn (STRONG MULTIMODAL BASELINE)
+# ==============================================================================
+
+class UVCRecMGAttn(
+    nn.Module
+):
+
+    def __init__(
+        self
+    ):
+
+        super().__init__()
+
+
+        # ======================================================================
+        # MODALITY-SPECIFIC GRAPH EMBEDDINGS
+        # ======================================================================
+
+        self.user_text = nn.Embedding(
+            num_users,
+            EMBED_DIM
+        )
+
+
+        self.user_visual = nn.Embedding(
+            num_users,
+            EMBED_DIM
+        )
+
+
+        self.item_text = nn.Embedding(
+            num_items,
+            EMBED_DIM
+        )
+
+
+        self.item_visual = nn.Embedding(
+            num_items,
+            EMBED_DIM
+        )
+
+
+        nn.init.normal_(
+            self.user_text.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.user_visual.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.item_text.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.item_visual.weight,
+            std=0.01
+        )
+
+
+        # ======================================================================
+        # TEXT FEATURE PROJECTION
+        # ======================================================================
+
+        self.text_proj = nn.Sequential(
+
+            nn.Linear(
+                TEXT_DIM,
+                EMBED_DIM
+            ),
+
+            nn.LayerNorm(
+                EMBED_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            )
+        )
+
+
+        # ======================================================================
+        # HOTEL-LEVEL VISUAL FEATURE PROJECTION
+        #
+        # This preserves the successful V6 hotel-level visual representation.
+        # ======================================================================
+
+        self.visual_proj = nn.Sequential(
+
+            nn.Linear(
+                IMAGE_DIM,
+                EMBED_DIM
+            ),
+
+            nn.LayerNorm(
+                EMBED_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            )
+        )
+
+
+        # ======================================================================
+        # IMAGE-LEVEL TOKEN PROJECTION
+        #
+        # 512-D CLIP feature → 128-D attention space.
+        # ======================================================================
+
+        self.image_token_proj = nn.Sequential(
+
+            nn.Linear(
+                IMAGE_DIM,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+        )
+
+
+        # ======================================================================
+        # TEXT FUSION PROJECTION
+        # ======================================================================
+
+        self.text_expand = nn.Sequential(
+
+            nn.Linear(
+                EMBED_DIM,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+        )
+
+
+        # ======================================================================
+        # VISUAL GRAPH PROJECTION
+        # ======================================================================
+
+        self.visual_expand = nn.Sequential(
+
+            nn.Linear(
+                EMBED_DIM,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+        )
+
+
+        # ======================================================================
+        # USER VISUAL QUERY
+        # ======================================================================
+
+        self.user_query = nn.Linear(
+
+            FUSION_DIM,
+
+            FUSION_DIM,
+
+            bias=False
+        )
+
+
+        # ======================================================================
+        # TEXT QUERY
+        # ======================================================================
+
+        self.text_query = nn.Linear(
+
+            FUSION_DIM,
+
+            FUSION_DIM,
+
+            bias=False
+        )
+
+
+        # ======================================================================
+        # MULTI-HEAD ATTENTION
+        #
+        # One attention layer for text-conditioned image selection.
+        # One attention layer for user-conditioned image selection.
+        # ======================================================================
+
+        self.text_image_attention = nn.MultiheadAttention(
+
+            embed_dim=FUSION_DIM,
+
+            num_heads=NUM_HEADS,
+
+            dropout=DROPOUT,
+
+            batch_first=True
+        )
+
+
+        self.user_image_attention = nn.MultiheadAttention(
+
+            embed_dim=FUSION_DIM,
+
+            num_heads=NUM_HEADS,
+
+            dropout=DROPOUT,
+
+            batch_first=True
+        )
+
+
+        # ======================================================================
+        # TEXT-VISUAL CROSS INTERACTION
+        # ======================================================================
+
+        self.cross_modal = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 2,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            )
+        )
+
+
+        # ======================================================================
+        # USER-CONDITIONED MODALITY GATE
+        # ======================================================================
+
+        self.modality_gate = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 4,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM,
+                FUSION_DIM
+            ),
+
+            nn.Sigmoid()
+        )
+
+
+        # ======================================================================
+        # FINAL ITEM FUSION
+        # ======================================================================
+
+        self.item_fusion = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 3,
+                FUSION_DIM * 2
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM * 2
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM * 2,
+                EMBED_DIM
+            )
+        )
+
+
+        # ======================================================================
+        # FINAL USER FUSION
+        # ======================================================================
+
+        self.user_fusion = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 2,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM,
+                EMBED_DIM
+            )
+        )
+
+
+        # ======================================================================
+        # LEARNED MULTIMODAL RESIDUAL SCALE
+        # ======================================================================
+
+        self.alpha = nn.Parameter(
+
+            torch.tensor(
+                0.10,
+                dtype=torch.float32
+            )
+        )
+
+
+    # ==========================================================================
+    # GRAPH PROPAGATION
+    # ==========================================================================
+
+    def propagate(
+        self,
+        user_embedding,
+        item_embedding
+    ):
+
+        e = torch.cat(
+            [
+                user_embedding,
+                item_embedding
+            ],
+            dim=0
+        )
+
+
+        outputs = [
+            e
+        ]
+
+
+        for _ in range(
+            K_LAYERS
+        ):
+
+            e = torch.sparse.mm(
+                sparse_adj,
+                e
+            )
+
+
+            outputs.append(
+                e
+            )
+
+
+        e = torch.stack(
+            outputs,
+            dim=1
+        ).mean(
+            dim=1
+        )
+
+
+        user_out, item_out = torch.split(
+            e,
+            [
+                num_users,
+                num_items
+            ],
+            dim=0
+        )
+
+
+        return (
+            user_out,
+            item_out
+        )
+
+
+    # ==========================================================================
+    # MODALITY-SPECIFIC GRAPH REPRESENTATIONS
+    # ==========================================================================
+
+    def graph_representations(
+        self
+    ):
+
+        # ----------------------------------------------------------------------
+        # TEXT GRAPH
+        # ----------------------------------------------------------------------
+
+        text_item_input = (
+
+            self.item_text.weight
+
+            +
+
+            self.text_proj(
+                sbert_tensor
+            )
+        )
+
+
+        text_users, text_items = (
+            self.propagate(
+                self.user_text.weight,
+                text_item_input
+            )
+        )
+
+
+        # ----------------------------------------------------------------------
+        # VISUAL GRAPH
+        # ----------------------------------------------------------------------
+
+        visual_item_input = (
+
+            self.item_visual.weight
+
+            +
+
+            self.visual_proj(
+                hotel_mean
+            )
+        )
+
+
+        visual_users, visual_items = (
+            self.propagate(
+                self.user_visual.weight,
+                visual_item_input
+            )
+        )
+
+
+        return (
+
+            text_users,
+            text_items,
+
+            visual_users,
+            visual_items
+        )
+
+
+    # ==========================================================================
+    # IMAGE ATTENTION
+    #
+    # Input:
+    #   text_repr
+    #   user_repr
+    #   image_tokens
+    #   image_mask
+    #
+    # Output:
+    #   text-attended image representation
+    #   user-attended image representation
+    # ==========================================================================
+
+    def attend_images(
+        self,
+        text_repr,
+        user_repr,
+        image_tokens,
+        image_mask
+    ):
+
+        # image_tokens:
+        #   N x 32 x 128
+        #
+        # image_mask:
+        #   N x 32
+
+
+        key_padding_mask = ~image_mask
+
+
+        # ----------------------------------------------------------------------
+        # Text query
+        # ----------------------------------------------------------------------
+
+        text_query = self.text_query(
+            text_repr
+        ).unsqueeze(
+            1
+        )
+
+
+        text_context, text_weights = (
+            self.text_image_attention(
+                query=text_query,
+                key=image_tokens,
+                value=image_tokens,
+                key_padding_mask=key_padding_mask,
+                need_weights=True
+            )
+        )
+
+
+        text_context = text_context[
+            :,
+            0,
+            :
+        ]
+
+
+        text_weights = text_weights[
+            :,
+            0,
+            :
+        ]
+
+
+        # ----------------------------------------------------------------------
+        # User query
+        # ----------------------------------------------------------------------
+
+        user_query = self.user_query(
+            user_repr
+        ).unsqueeze(
+            1
+        )
+
+
+        user_context, user_weights = (
+            self.user_image_attention(
+                query=user_query,
+                key=image_tokens,
+                value=image_tokens,
+                key_padding_mask=key_padding_mask,
+                need_weights=True
+            )
+        )
+
+
+        user_context = user_context[
+            :,
+            0,
+            :
+        ]
+
+
+        user_weights = user_weights[
+            :,
+            0,
+            :
+        ]
+
+
+        return (
+            text_context,
+            user_context,
+            text_weights,
+            user_weights
+        )
+
+
+    # ==========================================================================
+    # MULTIMODAL ITEM REPRESENTATION
+    #
+    # Supports:
+    #
+    #   users: B
+    #   items: B x N
+    # ==========================================================================
+
+    def pair_representation(
+        self,
+        users,
+        items,
+        return_attention=False
+    ):
+
+        batch_size, n_items = (
+            items.shape
+        )
+
+
+        (
+            text_users,
+            text_items,
+            visual_users,
+            visual_items
+        ) = self.graph_representations()
+
+
+        # ----------------------------------------------------------------------
+        # USER REPRESENTATIONS
+        # ----------------------------------------------------------------------
+
+        text_user_f = self.text_expand(
+            text_users[
+                users
+            ]
+        )
+
+
+        visual_user_f = self.visual_expand(
+            visual_users[
+                users
+            ]
+        )
+
+
+        # ----------------------------------------------------------------------
+        # ITEM REPRESENTATIONS
+        #
+        # B x N x 128
+        # ----------------------------------------------------------------------
+
+        text_item_f = self.text_expand(
+            text_items[
+                items
+            ]
+        )
+
+
+        visual_item_f = self.visual_expand(
+            visual_items[
+                items
+            ]
+        )
+
+
+        # ----------------------------------------------------------------------
+        # EXPAND USER REPRESENTATIONS
+        # ----------------------------------------------------------------------
+
+        text_user_exp = (
+            text_user_f
+            .unsqueeze(1)
+            .expand(
+                -1,
+                n_items,
+                -1
+            )
+        )
+
+
+        visual_user_exp = (
+            visual_user_f
+            .unsqueeze(1)
+            .expand(
+                -1,
+                n_items,
+                -1
+            )
+        )
+
+
+        # ----------------------------------------------------------------------
+        # FLATTEN USER-ITEM PAIRS
+        #
+        # B x N
+        # →
+        # B*N
+        # ----------------------------------------------------------------------
+
+        total_pairs = (
+            batch_size
+            *
+            n_items
+        )
+
+
+        flat_text = text_item_f.reshape(
+            total_pairs,
+            FUSION_DIM
+        )
+
+
+        flat_visual_graph = visual_item_f.reshape(
+            total_pairs,
+            FUSION_DIM
+        )
+
+
+        flat_text_user = text_user_exp.reshape(
+            total_pairs,
+            FUSION_DIM
+        )
+
+
+        flat_visual_user = visual_user_exp.reshape(
+            total_pairs,
+            FUSION_DIM
+        )
+
+
+        # ----------------------------------------------------------------------
+        # IMAGE TOKENS
+        #
+        # B x N x 32 x 512
+        # →
+        # B*N x 32 x 512
+        # ----------------------------------------------------------------------
+
+        raw_images = img_3d[
+            items
+        ]
+
+
+        raw_mask = img_msk[
+            items
+        ]
+
+
+        flat_images = raw_images.reshape(
+            total_pairs,
+            raw_images.shape[2],
+            raw_images.shape[3]
+        )
+
+
+        flat_mask = raw_mask.reshape(
+            total_pairs,
+            raw_mask.shape[2]
+        )
+
+
+        # ----------------------------------------------------------------------
+        # IMAGE PROJECTION
+        # ----------------------------------------------------------------------
+
+        flat_image_tokens = self.image_token_proj(
+            flat_images
+        )
+
+
+        # ----------------------------------------------------------------------
+        # IMAGE ATTENTION
+        # ----------------------------------------------------------------------
+
+        (
+            text_context,
+            user_context,
+            text_weights,
+            user_weights
+        ) = self.attend_images(
+
+            flat_text,
+
+            flat_visual_user,
+
+            flat_image_tokens,
+
+            flat_mask
+        )
+
+
+        # ----------------------------------------------------------------------
+        # TEXT-VISUAL INTERACTION
+        # ----------------------------------------------------------------------
+
+        cross = self.cross_modal(
+            torch.cat(
+                [
+                    flat_text,
+                    text_context
+                ],
+                dim=-1
+            )
+        )
+
+
+        # ----------------------------------------------------------------------
+        # USER-CONDITIONED MODALITY GATE
+        # ----------------------------------------------------------------------
+
+        gate_input = torch.cat(
+            [
+                flat_text_user,
+                flat_visual_user,
+                flat_text,
+                flat_visual_graph
+            ],
+            dim=-1
+        )
+
+
+        gate = self.modality_gate(
+            gate_input
+        )
+
+
+        # ----------------------------------------------------------------------
+        # ATTENTION-ENHANCED VISUAL REPRESENTATION
+        # ----------------------------------------------------------------------
+
+        attentive_visual = (
+            gate
+            *
+            user_context
+            +
+            (1.0 - gate)
+            *
+            text_context
+        )
+
+
+        # ----------------------------------------------------------------------
+        # FINAL ITEM FUSION
+        # ----------------------------------------------------------------------
+
+        item_fusion_input = torch.cat(
+            [
+                attentive_visual,
+                cross,
+                flat_visual_user
+            ],
+            dim=-1
+        )
+
+
+        fused_delta = self.item_fusion(
+            item_fusion_input
+        )
+
+
+        fused_delta = fused_delta.reshape(
+            batch_size,
+            n_items,
+            EMBED_DIM
+        )
+
+
+        # ----------------------------------------------------------------------
+        # TEXT RESIDUAL
+        # ----------------------------------------------------------------------
+
+        fused_item = (
+
+            text_items[
+                items
+            ]
+
+            +
+
+            torch.tanh(
+                self.alpha
+            )
+            *
+            fused_delta
+        )
+
+
+        # ----------------------------------------------------------------------
+        # USER FUSION
+        # ----------------------------------------------------------------------
+
+        user_fusion_input = torch.cat(
+            [
+                text_user_f,
+                visual_user_f
+            ],
+            dim=-1
+        )
+
+
+        fused_user = self.user_fusion(
+            user_fusion_input
+        )
+
+
+        # ----------------------------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------------------------
+
+        if return_attention:
+
+            attention_shape = (
+                batch_size,
+                n_items,
+                img_3d.shape[1]
+            )
+
+
+            return (
+
+                fused_user,
+
+                fused_item,
+
+                text_weights.reshape(
+                    attention_shape
+                ),
+
+                user_weights.reshape(
+                    attention_shape
+                )
+            )
+
+
+        return (
+            fused_user,
+            fused_item
+        )
+
+
+    # ==========================================================================
+    # PAIRWISE SCORING
+    # ==========================================================================
+
+    def forward_pairs(
+        self,
+        users,
+        items
+    ):
+
+        fused_user, fused_item = (
+            self.pair_representation(
+                users,
+                items
+            )
+        )
+
+
+        scores = (
+
+            fused_user.unsqueeze(1)
+
+            *
+
+            fused_item
+
+        ).sum(
+            dim=-1
+        )
+
+
+        return scores
+
+
+    # ==========================================================================
+    # FULL-CATALOG SCORING
+    #
+    # Uses small catalog chunks to control GPU memory.
+    # ==========================================================================
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        (
+            text_users,
+            text_items,
+            visual_users,
+            visual_items
+        ) = self.graph_representations()
+
+
+        # ----------------------------------------------------------------------
+        # USER REPRESENTATIONS
+        # ----------------------------------------------------------------------
+
+        text_user = self.text_expand(
+            text_users[
+                users
+            ]
+        )
+
+
+        visual_user = self.visual_expand(
+            visual_users[
+                users
+            ]
+        )
+
+
+        user_fusion_input = torch.cat(
+            [
+                text_user,
+                visual_user
+            ],
+            dim=-1
+        )
+
+
+        fused_users = self.user_fusion(
+            user_fusion_input
+        )
+
+
+        batch_size = len(
+            users
+        )
+
+
+        outputs = []
+
+
+        # ----------------------------------------------------------------------
+        # PRECOMPUTE ITEM GRAPH FEATURES
+        # ----------------------------------------------------------------------
+
+        text_items_f = self.text_expand(
+            text_items
+        )
+
+
+        visual_items_f = self.visual_expand(
+            visual_items
+        )
+
+
+        # ----------------------------------------------------------------------
+        # CATALOG CHUNKS
+        # ----------------------------------------------------------------------
+
+        for start in range(
+            0,
+            num_items,
+            IMAGE_CHUNK
+        ):
+
+            end = min(
+                start + IMAGE_CHUNK,
+                num_items
+            )
+
+
+            chunk_size = (
+                end - start
+            )
+
+
+            # --------------------------------------------------------------
+            # Item features
+            # --------------------------------------------------------------
+
+            chunk_text = text_items_f[
+                start:end
+            ]
+
+
+            chunk_visual = visual_items_f[
+                start:end
+            ]
+
+
+            # --------------------------------------------------------------
+            # Image tokens
+            # --------------------------------------------------------------
+
+            chunk_images = img_3d[
+                start:end
+            ]
+
+
+            chunk_mask = img_msk[
+                start:end
+            ]
+
+
+            # --------------------------------------------------------------
+            # B x C x K x D
+            # --------------------------------------------------------------
+
+            image_tokens = self.image_token_proj(
+                chunk_images
+            )
+
+
+            image_tokens = (
+                image_tokens
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1,
+                    -1
+                )
+            )
+
+
+            image_mask = (
+                chunk_mask
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            # --------------------------------------------------------------
+            # B x C x D
+            # --------------------------------------------------------------
+
+            text_chunk = (
+                chunk_text
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            visual_chunk = (
+                chunk_visual
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            text_user_chunk = (
+                text_user
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    chunk_size,
+                    -1
+                )
+            )
+
+
+            visual_user_chunk = (
+                visual_user
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    chunk_size,
+                    -1
+                )
+            )
+
+
+            # --------------------------------------------------------------
+            # Flatten B x C
+            # --------------------------------------------------------------
+
+            total_pairs = (
+                batch_size
+                *
+                chunk_size
+            )
+
+
+            flat_text = text_chunk.reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+
+
+            flat_visual = visual_chunk.reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+
+
+            flat_text_user = text_user_chunk.reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+
+
+            flat_visual_user = visual_user_chunk.reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+
+
+            flat_tokens = image_tokens.reshape(
+                total_pairs,
+                img_3d.shape[1],
+                FUSION_DIM
+            )
+
+
+            flat_mask = image_mask.reshape(
+                total_pairs,
+                img_3d.shape[1]
+            )
+
+
+            # --------------------------------------------------------------
+            # IMAGE ATTENTION
+            # --------------------------------------------------------------
+
+            (
+                text_context,
+                user_context,
+                _,
+                _
+            ) = self.attend_images(
+
+                flat_text,
+
+                flat_visual_user,
+
+                flat_tokens,
+
+                flat_mask
+            )
+
+
+            # --------------------------------------------------------------
+            # CROSS-MODAL INTERACTION
+            # --------------------------------------------------------------
+
+            cross = self.cross_modal(
+                torch.cat(
+                    [
+                        flat_text,
+                        text_context
+                    ],
+                    dim=-1
+                )
+            )
+
+
+            # --------------------------------------------------------------
+            # GATE
+            # --------------------------------------------------------------
+
+            gate_input = torch.cat(
+                [
+                    flat_text_user,
+                    flat_visual_user,
+                    flat_text,
+                    flat_visual
+                ],
+                dim=-1
+            )
+
+
+            gate = self.modality_gate(
+                gate_input
+            )
+
+
+            attentive_visual = (
+                gate
+                *
+                user_context
+                +
+                (1.0 - gate)
+                *
+                text_context
+            )
+
+
+            # --------------------------------------------------------------
+            # FUSION
+            # --------------------------------------------------------------
+
+            fusion_input = torch.cat(
+                [
+                    attentive_visual,
+                    cross,
+                    flat_visual_user
+                ],
+                dim=-1
+            )
+
+
+            fused_delta = self.item_fusion(
+                fusion_input
+            )
+
+
+            fused_delta = fused_delta.reshape(
+                batch_size,
+                chunk_size,
+                EMBED_DIM
+            )
+
+
+            # --------------------------------------------------------------
+            # TEXT RESIDUAL
+            # --------------------------------------------------------------
+
+            chunk_repr = (
+
+                chunk_text
+                .unsqueeze(0)
+
+                if False
+
+                else
+                text_items[
+                    start:end
+                ]
+                .unsqueeze(0)
+
+                +
+                torch.tanh(
+                    self.alpha
+                )
+                *
+                fused_delta
+            )
+
+
+            # --------------------------------------------------------------
+            # SCORES
+            # --------------------------------------------------------------
+
+            chunk_scores = (
+
+                fused_users.unsqueeze(1)
+
+                *
+
+                chunk_repr
+
+            ).sum(
+                dim=-1
+            )
+
+
+            outputs.append(
+                chunk_scores
+            )
+
+
+            del (
+                image_tokens,
+                image_mask,
+                text_chunk,
+                visual_chunk,
+                text_user_chunk,
+                visual_user_chunk,
+                flat_text,
+                flat_visual,
+                flat_text_user,
+                flat_visual_user,
+                flat_tokens,
+                flat_mask,
+                text_context,
+                user_context,
+                cross,
+                gate_input,
+                gate,
+                attentive_visual,
+                fusion_input,
+                fused_delta,
+                chunk_repr,
+                chunk_scores
+            )
+
+
+        return torch.cat(
+            outputs,
+            dim=1
+        )
+
+print('✅ UVCRecMGAttn definition loaded.')
+
+print('✅ UVCRec-MG-Attn definition loaded.')
+
+
+
+
+# %% PUBLIC NOTEBOOK CELL 10
+# ==============================================================================
+# CELL 10 — SAVRec: EVIDENCE-AWARE VISUAL RECOMMENDATION
+# ==============================================================================
+# SAVRec intentionally preserves the UVCRec-MG-Attn backbone. The proposed
+# change is the explicit evidence-conditioned reliability gate applied to the
+# attentive visual context. This avoids changing the final fusion pathway at
+# the same time as adding evidence. Evidence tensors are registered per model.
+
+class SAVRec(nn.Module):
+
+    def __init__(
+        self,
+        num_users,
+        num_items,
+        user_evidence=None,
+        item_evidence=None
+    ):
+
+        super().__init__()
+
+
+        # ======================================================================
+        # BASIC DIMENSIONS
+        # ======================================================================
+
+        self.num_users = num_users
+        self.num_items = num_items
+
+        if user_evidence is None:
+            user_evidence = USER_EVIDENCE
+        if item_evidence is None:
+            item_evidence = ITEM_EVIDENCE
+
+        self.register_buffer(
+            "user_evidence",
+            user_evidence.detach().float().clone()
+        )
+        self.register_buffer(
+            "item_evidence",
+            item_evidence.detach().float().clone()
+        )
+
+
+        # ======================================================================
+        # MODALITY-SPECIFIC GRAPH EMBEDDINGS
+        # ======================================================================
+
+        self.user_text = nn.Embedding(
+            num_users,
+            EMBED_DIM
+        )
+
+
+        self.user_visual = nn.Embedding(
+            num_users,
+            EMBED_DIM
+        )
+
+
+        self.item_text = nn.Embedding(
+            num_items,
+            EMBED_DIM
+        )
+
+
+        self.item_visual = nn.Embedding(
+            num_items,
+            EMBED_DIM
+        )
+
+
+        nn.init.normal_(
+            self.user_text.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.user_visual.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.item_text.weight,
+            std=0.01
+        )
+
+
+        nn.init.normal_(
+            self.item_visual.weight,
+            std=0.01
+        )
+
+
+        # ======================================================================
+        # TEXT PROJECTION
+        # ======================================================================
+
+        self.text_proj = nn.Sequential(
+
+            nn.Linear(
+                384,
+                EMBED_DIM
+            ),
+
+            nn.LayerNorm(
+                EMBED_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            )
+
+        )
+
+
+        # ======================================================================
+        # HOTEL VISUAL PROJECTION
+        # ======================================================================
+
+        self.visual_proj = nn.Sequential(
+
+            nn.Linear(
+                512,
+                EMBED_DIM
+            ),
+
+            nn.LayerNorm(
+                EMBED_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            )
+
+        )
+
+
+        # ======================================================================
+        # IMAGE TOKEN PROJECTION
+        # ======================================================================
+
+        self.image_token_proj = nn.Sequential(
+
+            nn.Linear(
+                512,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+
+        )
+
+
+        # ======================================================================
+        # FUSION PROJECTIONS
+        # ======================================================================
+
+        self.text_expand = nn.Sequential(
+
+            nn.Linear(
+                EMBED_DIM,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+
+        )
+
+
+        self.visual_expand = nn.Sequential(
+
+            nn.Linear(
+                EMBED_DIM,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+
+        )
+
+
+        # ======================================================================
+        # ATTENTION QUERY / KEY / VALUE
+        # ======================================================================
+
+        self.text_query = nn.Linear(
+            FUSION_DIM,
+            FUSION_DIM,
+            bias=False
+        )
+
+
+        self.user_query = nn.Linear(
+            FUSION_DIM,
+            FUSION_DIM,
+            bias=False
+        )
+
+
+
+
+        # ======================================================================
+        # IMAGE ATTENTION
+        # ======================================================================
+
+        self.text_image_attention = nn.MultiheadAttention(
+
+            embed_dim=FUSION_DIM,
+
+            num_heads=NUM_HEADS,
+
+            dropout=DROPOUT,
+
+            batch_first=True
+
+        )
+
+
+        self.user_image_attention = nn.MultiheadAttention(
+
+            embed_dim=FUSION_DIM,
+
+            num_heads=NUM_HEADS,
+
+            dropout=DROPOUT,
+
+            batch_first=True
+
+        )
+
+
+        # ======================================================================
+        # CROSS-MODAL FUSION
+        # ======================================================================
+
+        self.cross_modal = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 2,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            )
+
+        )
+
+
+        # ======================================================================
+        # EXISTING REPRESENTATION-BASED GATE
+        # ======================================================================
+
+        self.modality_gate = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 4,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM,
+                FUSION_DIM
+            ),
+
+            nn.Sigmoid()
+
+        )
+
+
+        # ======================================================================
+        # NEW EXPLICIT EVIDENCE ENCODER
+        # ======================================================================
+        #
+        # Input:
+        #
+        #   user_history_norm
+        #   hotel_popularity_norm
+        #   visual_availability
+        #   visual_coherence
+        #
+        # Dimension = 4
+        #
+        # ======================================================================
+
+        self.evidence_encoder = nn.Sequential(
+
+            nn.Linear(
+                4,
+                FUSION_DIM // 2
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM // 2
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM // 2,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU()
+
+        )
+
+
+        # ======================================================================
+        # NEW EVIDENCE-AWARE VISUAL RELIABILITY GATE
+        # ======================================================================
+        #
+        # Input:
+        #
+        #   visual user representation
+        #   visual item representation
+        #   explicit evidence representation
+        #
+        # Output:
+        #
+        #   scalar in [0,1]
+        #
+        # ======================================================================
+
+        self.evidence_visual_gate = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 3,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM,
+                1
+            ),
+
+            nn.Sigmoid()
+
+        )
+
+
+        # ======================================================================
+        # FINAL ITEM FUSION
+        # ======================================================================
+
+        self.item_fusion = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 3,
+                FUSION_DIM * 2
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM * 2
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM * 2,
+                EMBED_DIM
+            )
+
+        )
+
+
+        # ======================================================================
+        # FINAL USER FUSION
+        # ======================================================================
+
+        self.user_fusion = nn.Sequential(
+
+            nn.Linear(
+                FUSION_DIM * 2,
+                FUSION_DIM
+            ),
+
+            nn.LayerNorm(
+                FUSION_DIM
+            ),
+
+            nn.GELU(),
+
+            nn.Dropout(
+                DROPOUT
+            ),
+
+            nn.Linear(
+                FUSION_DIM,
+                EMBED_DIM
+            )
+
+        )
+
+
+        # ======================================================================
+        # MULTIMODAL RESIDUAL SCALE
+        # ======================================================================
+
+        self.alpha = nn.Parameter(
+            torch.tensor(
+                0.10,
+                dtype=torch.float32
+            )
+        )
+
+
+    # ==========================================================================
+    # GRAPH PROPAGATION
+    # ==========================================================================
+
+    def propagate(
+        self,
+        user_embedding,
+        item_embedding
+    ):
+
+        e = torch.cat(
+            [
+                user_embedding,
+                item_embedding
+            ],
+            dim=0
+        )
+
+
+        outputs = [
+            e
+        ]
+
+
+        for _ in range(
+            K_LAYERS
+        ):
+
+            e = torch.sparse.mm(
+                sparse_adj,
+                e
+            )
+
+
+            outputs.append(
+                e
+            )
+
+
+        e = torch.stack(
+            outputs,
+            dim=1
+        ).mean(
+            dim=1
+        )
+
+
+        user_out, item_out = torch.split(
+            e,
+            [
+                num_users,
+                num_items
+            ],
+            dim=0
+        )
+
+
+        return (
+            user_out,
+            item_out
+        )
+
+
+    # ==========================================================================
+    # GRAPH REPRESENTATIONS
+    # ==========================================================================
+
+    def graph_representations(
+        self
+    ):
+
+        # ----------------------------------------------------------------------
+        # TEXT GRAPH
+        # ----------------------------------------------------------------------
+
+        text_item_input = (
+
+            self.item_text.weight
+
+            +
+
+            self.text_proj(
+                sbert_tensor
+            )
+
+        )
+
+
+        text_users, text_items = (
+            self.propagate(
+                self.user_text.weight,
+                text_item_input
+            )
+        )
+
+
+        # ----------------------------------------------------------------------
+        # VISUAL GRAPH
+        # ----------------------------------------------------------------------
+
+        visual_item_input = (
+
+            self.item_visual.weight
+
+            +
+
+            self.visual_proj(
+                hotel_mean
+            )
+
+        )
+
+
+        visual_users, visual_items = (
+            self.propagate(
+                self.user_visual.weight,
+                visual_item_input
+            )
+        )
+
+
+        return (
+
+            text_users,
+            text_items,
+
+            visual_users,
+            visual_items
+
+        )
+
+
+    # ==========================================================================
+    # IMAGE ATTENTION
+    # ==========================================================================
+
+    def attend_images(
+        self,
+        text_repr,
+        user_repr,
+        image_tokens,
+        image_mask
+    ):
+
+        key_padding_mask = ~image_mask
+
+
+        # ----------------------------------------------------------------------
+        # TEXT-CONDITIONED IMAGE ATTENTION
+        # ----------------------------------------------------------------------
+
+        text_query = (
+            self.text_query(
+                text_repr
+            )
+            .unsqueeze(1)
+        )
+
+
+        text_context, text_weights = (
+            self.text_image_attention(
+                query=text_query,
+                key=image_tokens,
+                value=image_tokens,
+                key_padding_mask=key_padding_mask,
+                need_weights=True
+            )
+        )
+
+
+        text_context = (
+            text_context[
+                :,
+                0,
+                :
+            ]
+        )
+
+
+        text_weights = (
+            text_weights[
+                :,
+                0,
+                :
+            ]
+        )
+
+
+        # ----------------------------------------------------------------------
+        # USER-CONDITIONED IMAGE ATTENTION
+        # ----------------------------------------------------------------------
+
+        user_query = (
+            self.user_query(
+                user_repr
+            )
+            .unsqueeze(1)
+        )
+
+
+        user_context, user_weights = (
+            self.user_image_attention(
+                query=user_query,
+                key=image_tokens,
+                value=image_tokens,
+                key_padding_mask=key_padding_mask,
+                need_weights=True
+            )
+        )
+
+
+        user_context = (
+            user_context[
+                :,
+                0,
+                :
+            ]
+        )
+
+
+        user_weights = (
+            user_weights[
+                :,
+                0,
+                :
+            ]
+        )
+
+
+        return (
+
+            text_context,
+            user_context,
+
+            text_weights,
+            user_weights
+
+        )
+
+
+    # ==========================================================================
+    # PAIR REPRESENTATION
+    # ==========================================================================
+
+    def pair_representation(
+        self,
+        users,
+        items,
+        return_evidence_gate=False
+    ):
+
+        batch_size, n_items = (
+            items.shape
+        )
+
+
+        (
+            text_users,
+            text_items,
+
+            visual_users,
+            visual_items
+
+        ) = self.graph_representations()
+
+
+        # ----------------------------------------------------------------------
+        # USER REPRESENTATIONS
+        # ----------------------------------------------------------------------
+
+        text_user_f = self.text_expand(
+            text_users[
+                users
+            ]
+        )
+
+
+        visual_user_f = self.visual_expand(
+            visual_users[
+                users
+            ]
+        )
+
+
+        # ----------------------------------------------------------------------
+        # ITEM REPRESENTATIONS
+        # ----------------------------------------------------------------------
+
+        text_item_f = self.text_expand(
+            text_items[
+                items
+            ]
+        )
+
+
+        visual_item_f = self.visual_expand(
+            visual_items[
+                items
+            ]
+        )
+
+
+        # ----------------------------------------------------------------------
+        # EXPAND USERS
+        # ----------------------------------------------------------------------
+
+        text_user_exp = (
+            text_user_f
+            .unsqueeze(1)
+            .expand(
+                -1,
+                n_items,
+                -1
+            )
+        )
+
+
+        visual_user_exp = (
+            visual_user_f
+            .unsqueeze(1)
+            .expand(
+                -1,
+                n_items,
+                -1
+            )
+        )
+
+
+        total_pairs = (
+            batch_size
+            *
+            n_items
+        )
+
+
+        flat_text = (
+            text_item_f
+            .reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+        )
+
+
+        flat_visual_graph = (
+            visual_item_f
+            .reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+        )
+
+
+        flat_text_user = (
+            text_user_exp
+            .reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+        )
+
+
+        flat_visual_user = (
+            visual_user_exp
+            .reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+        )
+
+
+        # ----------------------------------------------------------------------
+        # IMAGE TOKENS
+        # ----------------------------------------------------------------------
+
+        raw_images = img_3d[
+            items
+        ]
+
+
+        raw_mask = img_msk[
+            items
+        ]
+
+
+        flat_images = raw_images.reshape(
+            total_pairs,
+            raw_images.shape[2],
+            raw_images.shape[3]
+        )
+
+
+        flat_mask = raw_mask.reshape(
+            total_pairs,
+            raw_mask.shape[2]
+        )
+
+
+        image_tokens = self.image_token_proj(
+            flat_images
+        )
+
+
+        # ----------------------------------------------------------------------
+        # IMAGE ATTENTION
+        # ----------------------------------------------------------------------
+
+        (
+            text_context,
+            user_context,
+
+            text_weights,
+            user_weights
+
+        ) = self.attend_images(
+
+            flat_text,
+
+            flat_visual_user,
+
+            image_tokens,
+
+            flat_mask
+
+        )
+
+
+        # ----------------------------------------------------------------------
+        # TEXT-VISUAL CROSS INTERACTION
+        # ----------------------------------------------------------------------
+
+        cross = self.cross_modal(
+
+            torch.cat(
+                [
+                    flat_text,
+                    text_context
+                ],
+                dim=-1
+            )
+
+        )
+
+
+        # ----------------------------------------------------------------------
+        # ORIGINAL REPRESENTATION-BASED GATE
+        # ----------------------------------------------------------------------
+
+        original_gate_input = torch.cat(
+            [
+                flat_text_user,
+                flat_visual_user,
+                flat_text,
+                flat_visual_graph
+            ],
+            dim=-1
+        )
+
+
+        original_gate = self.modality_gate(
+            original_gate_input
+        )
+
+
+        # ----------------------------------------------------------------------
+        # ORIGINAL ATTENTION-ENHANCED VISUAL REPRESENTATION
+        # ----------------------------------------------------------------------
+
+        attentive_visual = (
+
+            original_gate
+            *
+            user_context
+
+            +
+
+            (
+                1.0
+                -
+                original_gate
+            )
+            *
+            text_context
+
+        )
+
+
+        # ----------------------------------------------------------------------
+        # EXPLICIT EVIDENCE FEATURES
+        # ----------------------------------------------------------------------
+
+        pair_user_ids = (
+            users
+            .unsqueeze(1)
+            .expand(
+                -1,
+                n_items
+            )
+            .reshape(
+                total_pairs
+            )
+        )
+
+
+        pair_item_ids = (
+            items
+            .reshape(
+                total_pairs
+            )
+        )
+
+
+        explicit_user_evidence = (
+            self.user_evidence[
+                pair_user_ids
+            ]
+        )
+
+
+        explicit_item_evidence = (
+            self.item_evidence[
+                pair_item_ids
+            ]
+        )
+
+
+        explicit_evidence = torch.cat(
+            [
+                explicit_user_evidence,
+                explicit_item_evidence
+            ],
+            dim=-1
+        )
+
+
+        # Expected:
+        #
+        #   explicit_evidence = [N, 4]
+        #
+
+        assert explicit_evidence.shape[-1] == 4
+
+
+        evidence_repr = self.evidence_encoder(
+            explicit_evidence
+        )
+
+
+        # Expected:
+        #
+        #   evidence_repr = [N, 128]
+        #
+
+        assert evidence_repr.shape[-1] == FUSION_DIM
+
+
+        # ----------------------------------------------------------------------
+        # NEW EVIDENCE GATE
+        # ----------------------------------------------------------------------
+
+        evidence_gate_input = torch.cat(
+            [
+                flat_visual_user,
+                flat_visual_graph,
+                evidence_repr
+            ],
+            dim=-1
+        )
+
+
+        # Expected:
+        #
+        #   128 + 128 + 128 = 384
+        #
+
+        assert (
+            evidence_gate_input.shape[-1]
+            ==
+            FUSION_DIM * 3
+        )
+
+
+        evidence_gate = (
+            self.evidence_visual_gate(
+                evidence_gate_input
+            )
+        )
+
+
+        # Expected:
+        #
+        #   [N, 1]
+        #
+
+        assert evidence_gate.shape[-1] == 1
+
+
+        # ----------------------------------------------------------------------
+        # APPLY NEW VISUAL RELIABILITY GATE
+        # ----------------------------------------------------------------------
+
+        gated_visual_context = (
+
+            evidence_gate
+            *
+            attentive_visual
+
+        )
+
+
+        # ----------------------------------------------------------------------
+        # FINAL ITEM FUSION
+        # ----------------------------------------------------------------------
+
+        item_fusion_input = torch.cat(
+            [
+                gated_visual_context,
+                cross,
+                flat_visual_user
+            ],
+            dim=-1
+        )
+
+
+        # Expected:
+        #
+        #   128 + 128 + 128 = 384
+        #
+
+        assert (
+            item_fusion_input.shape[-1]
+            ==
+            FUSION_DIM * 3
+        )
+
+
+        fused_delta = self.item_fusion(
+            item_fusion_input
+        )
+
+
+        # Expected:
+        #
+        #   [N, 64]
+        #
+
+        assert fused_delta.shape[-1] == EMBED_DIM
+
+
+        fused_delta = (
+            fused_delta
+            .reshape(
+                batch_size,
+                n_items,
+                EMBED_DIM
+            )
+        )
+
+
+        # ----------------------------------------------------------------------
+        # TEXT RESIDUAL
+        # ----------------------------------------------------------------------
+        #
+        # IMPORTANT:
+        #
+        # text_item_f is 128-D.
+        #
+        # fused_delta is 64-D.
+        #
+        # Therefore we MUST NOT do:
+        #
+        #     text_item_f + fused_delta
+        #
+        # Instead use the original propagated text item representation,
+        # which is 64-D.
+        #
+        # This is consistent with the intended recommendation-space residual.
+        #
+        # ----------------------------------------------------------------------
+
+        text_item_residual = text_items[
+            items
+        ]
+
+
+        fused_item = (
+
+            text_item_residual
+
+            +
+
+            torch.tanh(
+                self.alpha
+            )
+            *
+            fused_delta
+
+        )
+
+
+        # ----------------------------------------------------------------------
+        # USER FUSION
+        # ----------------------------------------------------------------------
+
+        user_fusion_input = torch.cat(
+            [
+                text_user_f,
+                visual_user_f
+            ],
+            dim=-1
+        )
+
+
+        fused_user = self.user_fusion(
+            user_fusion_input
+        )
+
+
+        # ----------------------------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------------------------
+
+        if return_evidence_gate:
+
+            return (
+
+                fused_user,
+
+                fused_item,
+
+                evidence_gate.reshape(
+                    batch_size,
+                    n_items
+                ),
+
+                original_gate.reshape(
+                    batch_size,
+                    n_items,
+                    FUSION_DIM
+                ),
+
+                text_weights.reshape(
+                    batch_size,
+                    n_items,
+                    img_3d.shape[1]
+                ),
+
+                user_weights.reshape(
+                    batch_size,
+                    n_items,
+                    img_3d.shape[1]
+                )
+
+            )
+
+
+        return (
+
+            fused_user,
+
+            fused_item
+
+        )
+
+
+    # ==========================================================================
+    # PAIRWISE SCORING
+    # ==========================================================================
+
+    def forward_pairs(
+        self,
+        users,
+        items
+    ):
+
+        fused_user, fused_item = (
+            self.pair_representation(
+                users,
+                items
+            )
+        )
+
+
+        scores = (
+
+            fused_user.unsqueeze(1)
+            *
+            fused_item
+
+        ).sum(
+            dim=-1
+        )
+
+
+        return scores
+
+
+    # ==========================================================================
+    # FULL-CATALOG SCORING
+    # ==========================================================================
+
+    def score_batch(
+        self,
+        users,
+        items=None,
+        catalog_matrix=None
+    ):
+
+        (
+            text_users,
+            text_items,
+
+            visual_users,
+            visual_items
+
+        ) = self.graph_representations()
+
+
+        # ----------------------------------------------------------------------
+        # USER REPRESENTATIONS
+        # ----------------------------------------------------------------------
+
+        text_user = self.text_expand(
+            text_users[
+                users
+            ]
+        )
+
+
+        visual_user = self.visual_expand(
+            visual_users[
+                users
+            ]
+        )
+
+
+        fused_users = self.user_fusion(
+            torch.cat(
+                [
+                    text_user,
+                    visual_user
+                ],
+                dim=-1
+            )
+        )
+
+
+        batch_size = len(
+            users
+        )
+
+
+        outputs = []
+
+
+        # ----------------------------------------------------------------------
+        # PRECOMPUTE ITEM FEATURES
+        # ----------------------------------------------------------------------
+
+        text_items_f = self.text_expand(
+            text_items
+        )
+
+
+        visual_items_f = self.visual_expand(
+            visual_items
+        )
+
+
+        # ==========================================================================
+        # CATALOG CHUNKS
+        # ==========================================================================
+
+        for start in range(
+            0,
+            num_items,
+            IMAGE_CHUNK
+        ):
+
+            end = min(
+                start + IMAGE_CHUNK,
+                num_items
+            )
+
+
+            chunk_size = (
+                end - start
+            )
+
+
+            # ------------------------------------------------------------------
+            # ITEM GRAPH FEATURES
+            # ------------------------------------------------------------------
+            #
+            # FUSION representations:
+            #
+            #   chunk_text   -> 128-D
+            #   chunk_visual -> 128-D
+            #
+            # FINAL RESIDUAL:
+            #
+            #   chunk_text_residual -> 64-D
+            #
+            # ------------------------------------------------------------------
+
+            chunk_text = text_items_f[
+                start:end
+            ]
+
+
+            chunk_visual = visual_items_f[
+                start:end
+            ]
+
+
+            # IMPORTANT:
+            #
+            # Original graph-propagated text representation.
+            #
+            # Shape:
+            #
+            #   [chunk_size, EMBED_DIM]
+            #
+            # = [chunk_size, 64]
+            #
+            # This will be used for the final residual.
+            #
+
+            chunk_text_residual = text_items[
+                start:end
+            ]
+
+
+            # ------------------------------------------------------------------
+            # IMAGE FEATURES
+            # ------------------------------------------------------------------
+
+            chunk_images = img_3d[
+                start:end
+            ]
+
+
+            chunk_mask = img_msk[
+                start:end
+            ]
+
+
+            image_tokens = self.image_token_proj(
+                chunk_images
+            )
+
+
+            image_tokens = (
+                image_tokens
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1,
+                    -1
+                )
+            )
+
+
+            image_mask = (
+                chunk_mask
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            # ------------------------------------------------------------------
+            # EXPAND ITEM FEATURES
+            # ------------------------------------------------------------------
+
+            text_chunk = (
+                chunk_text
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            visual_chunk = (
+                chunk_visual
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            text_user_chunk = (
+                text_user
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    chunk_size,
+                    -1
+                )
+            )
+
+
+            visual_user_chunk = (
+                visual_user
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    chunk_size,
+                    -1
+                )
+            )
+
+
+            total_pairs = (
+                batch_size
+                *
+                chunk_size
+            )
+
+
+            # ------------------------------------------------------------------
+            # FLATTEN
+            # ------------------------------------------------------------------
+
+            flat_text = text_chunk.reshape(
+                total_pairs,
+                FUSION_DIM
+            )
+
+
+            flat_visual_graph = (
+                visual_chunk.reshape(
+                    total_pairs,
+                    FUSION_DIM
+                )
+            )
+
+
+            flat_text_user = (
+                text_user_chunk.reshape(
+                    total_pairs,
+                    FUSION_DIM
+                )
+            )
+
+
+            flat_visual_user = (
+                visual_user_chunk.reshape(
+                    total_pairs,
+                    FUSION_DIM
+                )
+            )
+
+
+            # ------------------------------------------------------------------
+            # IMAGE TOKENS
+            # ------------------------------------------------------------------
+
+            flat_images = image_tokens.reshape(
+                total_pairs,
+                image_tokens.shape[2],
+                image_tokens.shape[3]
+            )
+
+
+            flat_mask = image_mask.reshape(
+                total_pairs,
+                image_mask.shape[2]
+            )
+
+
+            # ------------------------------------------------------------------
+            # IMAGE ATTENTION
+            # ------------------------------------------------------------------
+
+            (
+                text_context,
+                user_context,
+
+                _,
+                _
+
+            ) = self.attend_images(
+
+                flat_text,
+
+                flat_visual_user,
+
+                flat_images,
+
+                flat_mask
+
+            )
+
+
+            # ------------------------------------------------------------------
+            # CROSS-MODAL
+            # ------------------------------------------------------------------
+
+            cross = self.cross_modal(
+
+                torch.cat(
+                    [
+                        flat_text,
+                        text_context
+                    ],
+                    dim=-1
+                )
+
+            )
+
+
+            # ------------------------------------------------------------------
+            # EXISTING REPRESENTATION GATE
+            # ------------------------------------------------------------------
+
+            original_gate_input = torch.cat(
+                [
+                    flat_text_user,
+                    flat_visual_user,
+                    flat_text,
+                    flat_visual_graph
+                ],
+                dim=-1
+            )
+
+
+            original_gate = self.modality_gate(
+                original_gate_input
+            )
+
+
+            attentive_visual = (
+
+                original_gate
+                *
+                user_context
+
+                +
+
+                (
+                    1.0
+                    -
+                    original_gate
+                )
+                *
+                text_context
+
+            )
+
+
+            # ------------------------------------------------------------------
+            # EVIDENCE FEATURES
+            # ------------------------------------------------------------------
+
+            item_ids = torch.arange(
+                start,
+                end,
+                dtype=torch.long,
+                device=DEVICE
+            )
+
+
+            pair_item_ids = (
+                item_ids
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1
+                )
+                .reshape(
+                    total_pairs
+                )
+            )
+
+
+            pair_user_ids = (
+                users
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    chunk_size
+                )
+                .reshape(
+                    total_pairs
+                )
+            )
+
+
+            explicit_user_evidence = (
+                self.user_evidence[
+                    pair_user_ids
+                ]
+            )
+
+
+            explicit_item_evidence = (
+                self.item_evidence[
+                    pair_item_ids
+                ]
+            )
+
+
+            explicit_evidence = torch.cat(
+                [
+                    explicit_user_evidence,
+                    explicit_item_evidence
+                ],
+                dim=-1
+            )
+
+
+            # Expected:
+            #
+            #   [total_pairs, 4]
+            #
+
+            assert explicit_evidence.shape[-1] == 4
+
+
+            evidence_repr = self.evidence_encoder(
+                explicit_evidence
+            )
+
+
+            # Expected:
+            #
+            #   [total_pairs, 128]
+            #
+
+            assert evidence_repr.shape[-1] == FUSION_DIM
+
+
+            # ------------------------------------------------------------------
+            # NEW EVIDENCE GATE
+            # ------------------------------------------------------------------
+
+            evidence_gate_input = torch.cat(
+                [
+                    flat_visual_user,
+                    flat_visual_graph,
+                    evidence_repr
+                ],
+                dim=-1
+            )
+
+
+            # Expected:
+            #
+            #   128 + 128 + 128 = 384
+            #
+
+            assert (
+                evidence_gate_input.shape[-1]
+                ==
+                FUSION_DIM * 3
+            )
+
+
+            evidence_gate = (
+                self.evidence_visual_gate(
+                    evidence_gate_input
+                )
+            )
+
+
+            # Expected:
+            #
+            #   [total_pairs, 1]
+            #
+
+            assert evidence_gate.shape[-1] == 1
+
+
+            # ------------------------------------------------------------------
+            # APPLY NEW VISUAL RELIABILITY GATE
+            # ------------------------------------------------------------------
+
+            gated_visual_context = (
+
+                evidence_gate
+                *
+                attentive_visual
+
+            )
+
+
+            # ------------------------------------------------------------------
+            # ITEM FUSION
+            # ------------------------------------------------------------------
+
+            item_fusion_input = torch.cat(
+                [
+                    gated_visual_context,
+                    cross,
+                    flat_visual_user
+                ],
+                dim=-1
+            )
+
+
+            # Expected:
+            #
+            #   128 + 128 + 128 = 384
+            #
+
+            assert (
+                item_fusion_input.shape[-1]
+                ==
+                FUSION_DIM * 3
+            )
+
+
+            fused_delta = self.item_fusion(
+                item_fusion_input
+            )
+
+
+            # Expected:
+            #
+            #   [total_pairs, 64]
+            #
+
+            assert fused_delta.shape[-1] == EMBED_DIM
+
+
+            fused_delta = (
+                fused_delta
+                .reshape(
+                    batch_size,
+                    chunk_size,
+                    EMBED_DIM
+                )
+            )
+
+
+            # ------------------------------------------------------------------
+            # FINAL ITEM
+            # ------------------------------------------------------------------
+            #
+            # IMPORTANT DIMENSION FIX
+            #
+            # chunk_text:
+            #       [batch, chunk, 128]
+            #
+            # fused_delta:
+            #       [batch, chunk, 64]
+            #
+            # These CANNOT be added.
+            #
+            # Instead:
+            #
+            # chunk_text_residual:
+            #       [chunk, 64]
+            #
+            # expand to:
+            #
+            #       [batch, chunk, 64]
+            #
+            # Then:
+            #
+            #       64-D + 64-D -> 64-D
+            #
+            # ------------------------------------------------------------------
+
+            chunk_text_residual_expanded = (
+                chunk_text_residual
+                .unsqueeze(0)
+                .expand(
+                    batch_size,
+                    -1,
+                    -1
+                )
+            )
+
+
+            # Explicit dimension check before residual addition.
+
+            assert (
+                chunk_text_residual_expanded.shape[-1]
+                ==
+                fused_delta.shape[-1]
+                ==
+                EMBED_DIM
+            )
+
+
+            fused_item = (
+
+                chunk_text_residual_expanded
+
+                +
+
+                torch.tanh(
+                    self.alpha
+                )
+                *
+                fused_delta
+
+            )
+
+
+            # Final item representation must be EMBED_DIM.
+
+            assert fused_item.shape[-1] == EMBED_DIM
+
+
+            # ------------------------------------------------------------------
+            # SCORE
+            # ------------------------------------------------------------------
+
+            chunk_scores = (
+
+                fused_users.unsqueeze(1)
+                *
+                fused_item
+
+            ).sum(
+                dim=-1
+            )
+
+
+            outputs.append(
+                chunk_scores
+            )
+
+
+        # ----------------------------------------------------------------------
+        # FINAL CATALOG OUTPUT
+        # ----------------------------------------------------------------------
+
+        scores = torch.cat(
+            outputs,
+            dim=1
+        )
+
+
+        assert scores.shape == (
+            batch_size,
+            num_items
+        )
+
+
+        return scores
+
+
+
+print('✅ SAVRec definition loaded.')
+
+
+# %% PUBLIC NOTEBOOK CELL 11
+# ==============================================================================
+# CELL 11 — COMMON TRAINING / CHECKPOINT FRAMEWORK
+# ==============================================================================
+
+
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# Same TRAIN-only positive lookup for every BPR-trained model.
+user_pos_items = {}
+for user_key, group in train_df.groupby('user_id', sort=False):
+    uid = user2idx[str(user_key)]
+    user_pos_items[uid] = {
+        item2idx[str(x)]
+        for x in group['img_hotel_id'].astype(str)
+    }
+
+# ------------------------------------------------------------------------------
+# Validation checkpoint-selection set
+# ------------------------------------------------------------------------------
+# If a subset is requested, sample USERS, not interactions. All validation
+# positives of every selected user are retained so multi-positive relevance is
+# never truncated by the sampling procedure.
+# ------------------------------------------------------------------------------
+all_val_users = val_df['user_id'].astype(str).drop_duplicates().to_numpy()
+
+if VAL_SELECTION_USERS is None or VAL_SELECTION_USERS >= len(all_val_users):
+    selection_val_df = val_df.copy().reset_index(drop=True)
+else:
+    rng = np.random.default_rng(2026)
+    selected_users = set(
+        rng.choice(
+            all_val_users,
+            size=int(VAL_SELECTION_USERS),
+            replace=False
+        ).tolist()
+    )
+    selection_val_df = (
+        val_df[val_df['user_id'].astype(str).isin(selected_users)]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+print(
+    'Validation checkpoint selection : '
+    f'{selection_val_df["user_id"].nunique():,} users / '
+    f'{len(selection_val_df):,} interactions'
+)
+
+
+def make_data_generators(seed):
+    """Isolate data-order/sampling RNG from model initialization/dropout RNG."""
+    perm_gen = torch.Generator(device=DEVICE)
+    neg_gen = torch.Generator(device=DEVICE)
+    perm_gen.manual_seed(int(seed) + 10_000)
+    neg_gen.manual_seed(int(seed) + 20_000)
+    return perm_gen, neg_gen
+
+
+def sample_uniform_negatives(users, generator):
+    """Uniformly sample one catalog item absent from each user's TRAIN history."""
+    bsz = int(users.numel())
+    out = torch.randint(
+        0,
+        num_items,
+        (bsz,),
+        dtype=torch.long,
+        device=DEVICE,
+        generator=generator
+    )
+
+    # Rejection is cheap because the catalog is large and histories are sparse.
+    for j in range(bsz):
+        uid = int(users[j].item())
+        seen = user_pos_items.get(uid, set())
+        cand = int(out[j].item())
+
+        while cand in seen:
+            cand = int(
+                torch.randint(
+                    0,
+                    num_items,
+                    (1,),
+                    device=DEVICE,
+                    generator=generator
+                ).item()
+            )
+
+        out[j] = cand
+
+    return out
+
+
+def pair_scores(model, users, pos, neg):
+    if hasattr(model, 'bpr_forward'):
+        return model.bpr_forward(users, pos, neg)
+
+    if hasattr(model, 'forward_pairs'):
+        scores = model.forward_pairs(
+            users,
+            torch.stack([pos, neg], dim=1)
+        )
+        return scores[:, 0], scores[:, 1]
+
+    if isinstance(model, TextOnly):
+        ug, ig = model.gcn()
+        items = model.item_base(ig)
+        u = ug[users]
+        return (
+            (u * items[pos]).sum(-1),
+            (u * items[neg]).sum(-1)
+        )
+
+    if isinstance(model, LightGCNOnly):
+        ug, ig = model.gcn()
+        u = ug[users]
+        return (
+            (u * ig[pos]).sum(-1),
+            (u * ig[neg]).sum(-1)
+        )
+
+    raise TypeError(f'No pairwise scorer for {type(model).__name__}')
+
+
+def cpu_state_dict(model):
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def train_bpr_seed(
+    model_name,
+    ctor,
+    seed,
+    weight_decay,
+    batch_size=TRAIN_BATCH_SIZE,
+    max_epochs=MAX_EPOCHS,
+    patience=PATIENCE,
+    checkpoint_dir=CHECKPOINT_DIR
+):
+    set_global_seed(seed)
+    model = ctor().to(DEVICE)
+
+    # Data generators are independent of model/dropout RNG and therefore use
+    # identical seed-specific data order / negative streams across BPR models.
+    perm_gen, neg_gen = make_data_generators(seed)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=weight_decay
+    )
+
+    best_ndcg = -1.0
+    best_epoch = None
+    best_state = None
+    best_metrics = None
+    stale = 0
+    history = []
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        perm = torch.randperm(
+            len(train_users),
+            device=DEVICE,
+            generator=perm_gen
+        )
+
+        loss_sum = 0.0
+        nb = 0
+
+        for start in range(0, len(train_users), batch_size):
+            ids = perm[start:start + batch_size]
+            users = train_users[ids]
+            pos = train_items[ids]
+            neg = sample_uniform_negatives(users, neg_gen)
+
+            ps, ns = pair_scores(model, users, pos, neg)
+            loss = -F.logsigmoid(ps - ns).mean()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+
+            loss_sum += float(loss.item())
+            nb += 1
+
+        model.eval()
+        with torch.no_grad():
+            vm = evaluate_model_v6(
+                model,
+                selection_val_df,
+                batch_size=VAL_BATCH_SIZE
+            )
+
+        row = {
+            'epoch': epoch,
+            'loss': loss_sum / max(nb, 1),
+            **{f'val_{k}': float(v) for k, v in vm.items()}
+        }
+        history.append(row)
+
+        print(
+            f'{model_name} seed={seed} ep={epoch:02d} '
+            f'loss={row["loss"]:.5f} '
+            f'Val user-NDCG@20={vm["NDCG@20"]:.6f}'
+        )
+
+        if vm['NDCG@20'] > best_ndcg + MIN_DELTA:
+            best_ndcg = float(vm['NDCG@20'])
+            best_epoch = epoch
+            best_state = cpu_state_dict(model)
+            best_metrics = dict(vm)
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                break
+
+    if best_state is None:
+        raise RuntimeError(f'No checkpoint selected for {model_name} seed {seed}')
+
+    safe = model_name.lower().replace(' ', '_').replace('-', '_')
+    ckpt = os.path.join(
+        checkpoint_dir,
+        f'best_{safe}_seed_{seed}.pt'
+    )
+    torch.save(best_state, ckpt)
+
+    meta = {
+        'model': model_name,
+        'seed': int(seed),
+        'lr': float(LR),
+        'weight_decay': float(weight_decay),
+        'batch_size': int(batch_size),
+        'best_epoch': int(best_epoch),
+        'best_validation_ndcg20': float(best_ndcg),
+        'best_validation_metrics': best_metrics,
+        'selection_validation_users': int(selection_val_df['user_id'].nunique()),
+        'selection_validation_interactions': int(len(selection_val_df)),
+        'evaluation_unit': 'user',
+        'evaluation_relevance': 'all held-out hotels per user',
+        'negative_sampling': 'uniform_unseen_train',
+        'data_rng_isolated_from_model_rng': True,
+        'test_used_for_selection': False,
+        'checkpoint': ckpt,
+        'history': history,
+    }
+
+    with open(
+        os.path.join(checkpoint_dir, f'best_{safe}_seed_{seed}.json'),
+        'w'
+    ) as f:
+        json.dump(meta, f, indent=2)
+
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return meta
+
+
+def train_bm3_seed(seed, weight_decay, batch_size=TRAIN_BATCH_SIZE):
+    set_global_seed(seed)
+    model = BM3().to(DEVICE)
+    perm_gen, _ = make_data_generators(seed)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=weight_decay
+    )
+
+    best_ndcg = -1.0
+    best_state = None
+    best_epoch = None
+    best_metrics = None
+    stale = 0
+    history = []
+
+    for epoch in range(1, MAX_EPOCHS + 1):
+        model.train()
+        perm = torch.randperm(
+            len(train_users),
+            device=DEVICE,
+            generator=perm_gen
+        )
+
+        loss_sum = 0.0
+        nb = 0
+
+        for start in range(0, len(train_users), batch_size):
+            ids = perm[start:start + batch_size]
+            users = train_users[ids]
+            items = train_items[ids]
+
+            loss = model.ssl_loss(users, items)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+
+            loss_sum += float(loss.item())
+            nb += 1
+
+        model.eval()
+        with torch.no_grad():
+            vm = evaluate_model_v6(
+                model,
+                selection_val_df,
+                batch_size=VAL_BATCH_SIZE
+            )
+
+        history.append({
+            'epoch': epoch,
+            'loss': loss_sum / max(nb, 1),
+            **{f'val_{k}': float(v) for k, v in vm.items()}
+        })
+
+        print(
+            f'BM3 seed={seed} ep={epoch:02d} '
+            f'loss={loss_sum/max(nb,1):.5f} '
+            f'Val user-NDCG@20={vm["NDCG@20"]:.6f}'
+        )
+
+        if vm['NDCG@20'] > best_ndcg + MIN_DELTA:
+            best_ndcg = float(vm['NDCG@20'])
+            best_state = cpu_state_dict(model)
+            best_epoch = epoch
+            best_metrics = dict(vm)
+            stale = 0
+        else:
+            stale += 1
+            if stale >= PATIENCE:
+                break
+
+    if best_state is None:
+        raise RuntimeError(f'No BM3 checkpoint selected for seed {seed}')
+
+    ckpt = os.path.join(CHECKPOINT_DIR, f'best_bm3_seed_{seed}.pt')
+    torch.save(best_state, ckpt)
+
+    meta = {
+        'model': 'BM3',
+        'seed': int(seed),
+        'lr': float(LR),
+        'weight_decay': float(weight_decay),
+        'batch_size': int(batch_size),
+        'best_epoch': int(best_epoch),
+        'best_validation_ndcg20': float(best_ndcg),
+        'best_validation_metrics': best_metrics,
+        'selection_validation_users': int(selection_val_df['user_id'].nunique()),
+        'selection_validation_interactions': int(len(selection_val_df)),
+        'evaluation_unit': 'user',
+        'evaluation_relevance': 'all held-out hotels per user',
+        'training_objective': 'compact_local_bm3_ssl_reimplementation',
+        'data_rng_isolated_from_model_rng': True,
+        'test_used_for_selection': False,
+        'checkpoint': ckpt,
+        'history': history,
+    }
+
+    with open(
+        os.path.join(CHECKPOINT_DIR, f'best_bm3_seed_{seed}.json'),
+        'w'
+    ) as f:
+        json.dump(meta, f, indent=2)
+
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return meta
+
+
+print('✅ Common training framework ready.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 12
+# ==============================================================================
+# CELL 12 — FINAL MODEL REGISTRY + PRE-TRAINING CONSISTENCY TESTS
+# ==============================================================================
+
+
+def make_savrec(user_evidence=USER_EVIDENCE, item_evidence=ITEM_EVIDENCE):
+    return SAVRec(
+        num_users=num_users,
+        num_items=num_items,
+        user_evidence=user_evidence,
+        item_evidence=item_evidence
+    )
+
+
+MODEL_CTORS = {
+    'LightGCN': lambda: LightGCNOnly(),
+    'Text-Only': lambda: TextOnly(),
+    'VBPR': lambda: VBPR(),
+    'MMGCN': lambda: MMGCN(),
+    'BM3': lambda: BM3(),
+    'UVCRec-MG-Attn': lambda: UVCRecMGAttn(),
+    'SAVRec': lambda: make_savrec(),
+}
+
+# ------------------------------------------------------------------------------
+# 1. Full-catalog scoring shape / finiteness
+# ------------------------------------------------------------------------------
+probe_users = torch.tensor([0, 1], dtype=torch.long, device=DEVICE)
+probe_pos = torch.tensor([0, 2], dtype=torch.long, device=DEVICE)
+probe_neg = torch.tensor([1, 3], dtype=torch.long, device=DEVICE)
+
+print('=' * 100)
+print('MODEL / SCORING CONSISTENCY AUDIT')
+print('=' * 100)
+
+for name, ctor in MODEL_CTORS.items():
+    # Fixed probe initialization; final training resets the requested seed again.
+    set_global_seed(123456)
+    model = ctor().to(DEVICE)
+    model.eval()
+
+    with torch.no_grad():
+        full_scores = model.score_batch(probe_users).float()
+
+    assert full_scores.shape == (2, num_items), (name, full_scores.shape)
+    assert torch.isfinite(full_scores).all(), name
+
+    # For models trained by BPR, verify pairwise scorer and full-catalog scorer
+    # represent the same scoring function. BM3 uses its own SSL objective and is
+    # therefore excluded from pair_scores().
+    consistency_text = 'score-only'
+    if name != 'BM3':
+        with torch.no_grad():
+            ps, ns = pair_scores(model, probe_users, probe_pos, probe_neg)
+
+        expected_ps = full_scores[
+            torch.arange(len(probe_users), device=DEVICE),
+            probe_pos
+        ]
+        expected_ns = full_scores[
+            torch.arange(len(probe_users), device=DEVICE),
+            probe_neg
+        ]
+
+        if not torch.allclose(ps, expected_ps, atol=1e-5, rtol=1e-4):
+            max_err = float((ps - expected_ps).abs().max().item())
+            raise RuntimeError(
+                f'{name}: positive pair/full score mismatch; max error={max_err}'
+            )
+
+        if not torch.allclose(ns, expected_ns, atol=1e-5, rtol=1e-4):
+            max_err = float((ns - expected_ns).abs().max().item())
+            raise RuntimeError(
+                f'{name}: negative pair/full score mismatch; max error={max_err}'
+            )
+
+        consistency_text = 'pair/full ✓'
+
+    params = sum(p.numel() for p in model.parameters())
+    print(
+        f'{name:<18} score={tuple(full_scores.shape)} '
+        f'params={params:,}  {consistency_text}'
+    )
+
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# ------------------------------------------------------------------------------
+# 2. SAVRec/UVCRec final-fusion backbone parity assertions
+# ------------------------------------------------------------------------------
+# Both classes must use the same 3*FUSION_DIM -> EMBED_DIM item-fusion layer.
+# SAVRec's extra capacity should come from the evidence encoder/gate, not from a
+# different base item-fusion dimensionality.
+# ------------------------------------------------------------------------------
+set_global_seed(654321)
+_uvc = UVCRecMGAttn().to(DEVICE)
+_sav = make_savrec().to(DEVICE)
+
+assert _uvc.item_fusion[0].in_features == FUSION_DIM * 3
+assert _sav.item_fusion[0].in_features == FUSION_DIM * 3
+assert _uvc.item_fusion[-1].out_features == EMBED_DIM
+assert _sav.item_fusion[-1].out_features == EMBED_DIM
+assert hasattr(_sav, 'evidence_encoder')
+assert hasattr(_sav, 'evidence_visual_gate')
+
+# Dead external image key/value projection layers must not exist; MultiheadAttention
+# performs its own key/value projections.
+assert not hasattr(_uvc, 'image_key')
+assert not hasattr(_uvc, 'image_value')
+assert not hasattr(_sav, 'image_key')
+assert not hasattr(_sav, 'image_value')
+
+print('✅ UVCRec/SAVRec item-fusion dimensions match; SAVRec adds explicit evidence modules.')
+
+del _uvc, _sav
+gc.collect()
+torch.cuda.empty_cache()
+
+# ------------------------------------------------------------------------------
+# 3. Evaluator smoke test on a tiny validation-user subset
+# ------------------------------------------------------------------------------
+probe_val_users = val_df['user_id'].astype(str).drop_duplicates().head(2)
+probe_val_df = val_df[val_df['user_id'].astype(str).isin(set(probe_val_users))].copy()
+
+set_global_seed(777)
+_probe_model = LightGCNOnly().to(DEVICE)
+_probe_model.eval()
+with torch.no_grad():
+    probe_metrics = evaluate_model_v6(
+        _probe_model,
+        probe_val_df,
+        batch_size=2
+    )
+
+for metric, value in probe_metrics.items():
+    assert np.isfinite(value), (metric, value)
+    assert 0.0 <= value <= 1.0, (metric, value)
+
+print('Evaluator smoke-test metrics:', probe_metrics)
+print('✅ All pre-training model/evaluator consistency tests passed.')
+print('=' * 100)
+
+del _probe_model
+gc.collect()
+torch.cuda.empty_cache()
+
+
+# %% PUBLIC NOTEBOOK CELL 14
+# ==============================================================================
+# CELL 13 — FINAL MAIN-TRAINING PREFLIGHT + VALIDATION MOST-POPULAR
+# ==============================================================================
+# Purpose:
+#   1. Freeze and save the main-training protocol.
+#   2. Verify that the cleaned benchmark / model registry are exactly the
+#      pre-training state validated in Cells 1–12.
+#   3. Evaluate Most-Popular on VALIDATION ONLY.
+#
+# IMPORTANT:
+#   - No test-set metric is computed in Cells 13–21.
+#   - Model selection is based only on validation user-NDCG@20.
+#   - The historical V6 test split has been inspected during prior development;
+#     therefore the paper must not call it an untouched/sealed holdout.
+# ==============================================================================
+
+import hashlib
+from datetime import datetime, timezone
+
+print('=' * 100)
+print('CELL 13 — FINAL MAIN-TRAINING PREFLIGHT')
+print('=' * 100)
+
+# ------------------------------------------------------------------------------
+# 1. Required frozen objects
+# ------------------------------------------------------------------------------
+_required = [
+    'train_df', 'val_df', 'test_df',
+    'user2idx', 'item2idx',
+    'num_users', 'num_items',
+    'USER_EVIDENCE', 'ITEM_EVIDENCE',
+    'MODEL_CTORS', 'MODEL_WEIGHT_DECAY',
+    'selection_val_df', 'train_bpr_seed', 'train_bm3_seed',
+    'evaluate_popularity_v6', 'CHECKPOINT_DIR', 'RESULT_DIR', 'ARTIFACT_DIR',
+]
+_missing = [x for x in _required if x not in globals()]
+if _missing:
+    raise RuntimeError('Missing required frozen objects: ' + ', '.join(_missing))
+
+# ------------------------------------------------------------------------------
+# 2. Freeze benchmark/protocol assertions
+# ------------------------------------------------------------------------------
+assert SEEDS == [42, 1, 7]
+assert num_users == 264_584
+assert num_items == 3_322
+assert len(train_df) == 265_003
+assert len(val_df) == 9_045
+assert len(test_df) == 1_098
+assert val_df['user_id'].astype(str).nunique() == 9_045
+assert test_df['user_id'].astype(str).nunique() == 1_098
+
+for split_name, frame in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    invalid_mask = (
+        frame['user_id'].astype(str).str.strip().str.lower().isin(INVALID_USER_IDS)
+    )
+    assert not invalid_mask.any(), f'Invalid user survived in {split_name}'
+
+assert selection_val_df['user_id'].astype(str).nunique() == len(selection_val_df)
+assert len(selection_val_df) == len(val_df), (
+    'Final journal training must use the full validation split. '
+    'Set VAL_SELECTION_USERS=None and rerun Cells 1–12.'
+)
+
+expected_models = [
+    'LightGCN',
+    'Text-Only',
+    'VBPR',
+    'MMGCN',
+    'BM3',
+    'UVCRec-MG-Attn',
+    'SAVRec',
+]
+assert list(MODEL_CTORS.keys()) == expected_models
+assert set(MODEL_WEIGHT_DECAY.keys()) == set(expected_models)
+
+# ------------------------------------------------------------------------------
+# 3. Save immutable main-training protocol manifest
+# ------------------------------------------------------------------------------
+MAIN_TRAINING_PROTOCOL = {
+    'created_utc': datetime.now(timezone.utc).isoformat(),
+    'experiment': 'SAVRec V7 cleaned main-model training',
+    'users': int(num_users),
+    'items': int(num_items),
+    'train_interactions': int(len(train_df)),
+    'validation_interactions': int(len(val_df)),
+    'validation_users': int(val_df['user_id'].astype(str).nunique()),
+    'historical_test_interactions': int(len(test_df)),
+    'historical_test_users': int(test_df['user_id'].astype(str).nunique()),
+    'seeds': [int(x) for x in SEEDS],
+    'learning_rate': float(LR),
+    'max_epochs': int(MAX_EPOCHS),
+    'patience': int(PATIENCE),
+    'min_delta': float(MIN_DELTA),
+    'grad_clip': float(GRAD_CLIP),
+    'default_bpr_batch_size': int(TRAIN_BATCH_SIZE),
+    'uvcrec_savrec_batch_size': int(SAVREC_BATCH_SIZE),
+    'validation_batch_size': int(VAL_BATCH_SIZE),
+    'selection_metric': 'user-NDCG@20',
+    'evaluation_unit': 'user',
+    'negative_sampling': 'uniform unseen TRAIN items',
+    'weight_decay': {k: float(v) for k, v in MODEL_WEIGHT_DECAY.items()},
+    'test_metrics_used_in_cells_13_21': False,
+    'test_used_for_checkpoint_selection': False,
+    'note': (
+        'The historical V6 test split was inspected during prior development; '
+        'Cells 13–21 intentionally do not compute test metrics.'
+    ),
+}
+
+protocol_path = os.path.join(ARTIFACT_DIR, 'main_training_protocol_v7.json')
+with open(protocol_path, 'w') as f:
+    json.dump(MAIN_TRAINING_PROTOCOL, f, indent=2)
+
+# ------------------------------------------------------------------------------
+# 4. Most-Popular validation baseline only
+# ------------------------------------------------------------------------------
+MOST_POPULAR_VAL = evaluate_popularity_v6(selection_val_df)
+
+most_popular_path = os.path.join(RESULT_DIR, 'validation_most_popular_v7.json')
+with open(most_popular_path, 'w') as f:
+    json.dump(
+        {
+            'model': 'Most-Popular',
+            'split': 'validation',
+            'users': int(selection_val_df['user_id'].astype(str).nunique()),
+            'interactions': int(len(selection_val_df)),
+            'metrics': {k: float(v) for k, v in MOST_POPULAR_VAL.items()},
+            'test_used': False,
+        },
+        f,
+        indent=2,
+    )
+
+# In-memory registry is convenient while running sequentially; Cell 21 also
+# reloads metadata from disk, so it remains robust after notebook interruptions.
+MAIN_TRAINING_META = {}
+
+print('\nFrozen training protocol:')
+print(json.dumps(MAIN_TRAINING_PROTOCOL, indent=2))
+print('\nMost-Popular VALIDATION metrics:')
+for metric, value in MOST_POPULAR_VAL.items():
+    print(f'  {metric:<10}: {value:.6f}')
+print(f'\nProtocol JSON   : {protocol_path}')
+print(f'Most-Popular JSON: {most_popular_path}')
+print('\n✅ Main-training preflight passed. No test metric was computed.')
+print('=' * 100)
+
+# %% PUBLIC NOTEBOOK CELL 15
+# ==============================================================================
+# CELL 14 — TRAIN LIGHTGCN — SEEDS 42 / 1 / 7
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 14 — LIGHTGCN THREE-SEED TRAINING')
+print('=' * 100)
+
+LIGHTGCN_RUNS = []
+
+for seed in SEEDS:
+    print(f'\n--- LightGCN | seed={seed} ---')
+    meta = train_bpr_seed(
+        model_name='LightGCN',
+        ctor=MODEL_CTORS['LightGCN'],
+        seed=seed,
+        weight_decay=MODEL_WEIGHT_DECAY['LightGCN'],
+        batch_size=TRAIN_BATCH_SIZE,
+        max_epochs=MAX_EPOCHS,
+        patience=PATIENCE,
+        checkpoint_dir=CHECKPOINT_DIR,
+    )
+    LIGHTGCN_RUNS.append(meta)
+
+MAIN_TRAINING_META['LightGCN'] = LIGHTGCN_RUNS
+
+print('\nBest validation user-NDCG@20 by seed:')
+for r in LIGHTGCN_RUNS:
+    print(
+        f"  seed={r['seed']} | epoch={r['best_epoch']} | "
+        f"NDCG@20={r['best_validation_ndcg20']:.6f}"
+    )
+print('✅ LightGCN complete.')
+
+# %% PUBLIC NOTEBOOK CELL 16
+# ==============================================================================
+# CELL 15 — TRAIN TEXT-ONLY — SEEDS 42 / 1 / 7
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 15 — TEXT-ONLY THREE-SEED TRAINING')
+print('=' * 100)
+
+TEXT_ONLY_RUNS = []
+
+for seed in SEEDS:
+    print(f'\n--- Text-Only | seed={seed} ---')
+    meta = train_bpr_seed(
+        model_name='Text-Only',
+        ctor=MODEL_CTORS['Text-Only'],
+        seed=seed,
+        weight_decay=MODEL_WEIGHT_DECAY['Text-Only'],
+        batch_size=TRAIN_BATCH_SIZE,
+        max_epochs=MAX_EPOCHS,
+        patience=PATIENCE,
+        checkpoint_dir=CHECKPOINT_DIR,
+    )
+    TEXT_ONLY_RUNS.append(meta)
+
+MAIN_TRAINING_META['Text-Only'] = TEXT_ONLY_RUNS
+
+print('\nBest validation user-NDCG@20 by seed:')
+for r in TEXT_ONLY_RUNS:
+    print(
+        f"  seed={r['seed']} | epoch={r['best_epoch']} | "
+        f"NDCG@20={r['best_validation_ndcg20']:.6f}"
+    )
+print('✅ Text-Only complete.')
+
+# %% PUBLIC NOTEBOOK CELL 17
+# ==============================================================================
+# CELL 16 — TRAIN VBPR — SEEDS 42 / 1 / 7
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 16 — VBPR THREE-SEED TRAINING')
+print('=' * 100)
+
+VBPR_RUNS = []
+
+for seed in SEEDS:
+    print(f'\n--- VBPR | seed={seed} ---')
+    meta = train_bpr_seed(
+        model_name='VBPR',
+        ctor=MODEL_CTORS['VBPR'],
+        seed=seed,
+        weight_decay=MODEL_WEIGHT_DECAY['VBPR'],
+        batch_size=TRAIN_BATCH_SIZE,
+        max_epochs=MAX_EPOCHS,
+        patience=PATIENCE,
+        checkpoint_dir=CHECKPOINT_DIR,
+    )
+    VBPR_RUNS.append(meta)
+
+MAIN_TRAINING_META['VBPR'] = VBPR_RUNS
+
+print('\nBest validation user-NDCG@20 by seed:')
+for r in VBPR_RUNS:
+    print(
+        f"  seed={r['seed']} | epoch={r['best_epoch']} | "
+        f"NDCG@20={r['best_validation_ndcg20']:.6f}"
+    )
+print('✅ VBPR complete.')
+
+# %% PUBLIC NOTEBOOK CELL 18
+# ==============================================================================
+# CELL 19 — TRAIN UVCREC-MG-ATTN — SEEDS 42 / 1 / 7
+# ==============================================================================
+# Central multimodal backbone comparator. It uses the SAME 512 training batch size
+# as SAVRec so the proposed-method comparison does not confound the batch regime.
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 19 — UVCREC-MG-ATTN THREE-SEED TRAINING')
+print('=' * 100)
+
+UVCREC_RUNS = []
+
+for seed in SEEDS:
+    print(f'\n--- UVCRec-MG-Attn | seed={seed} ---')
+    meta = train_bpr_seed(
+        model_name='UVCRec-MG-Attn',
+        ctor=MODEL_CTORS['UVCRec-MG-Attn'],
+        seed=seed,
+        weight_decay=MODEL_WEIGHT_DECAY['UVCRec-MG-Attn'],
+        batch_size=SAVREC_BATCH_SIZE,
+        max_epochs=MAX_EPOCHS,
+        patience=PATIENCE,
+        checkpoint_dir=CHECKPOINT_DIR,
+    )
+    UVCREC_RUNS.append(meta)
+
+MAIN_TRAINING_META['UVCRec-MG-Attn'] = UVCREC_RUNS
+
+print('\nBest validation user-NDCG@20 by seed:')
+for r in UVCREC_RUNS:
+    print(
+        f"  seed={r['seed']} | epoch={r['best_epoch']} | "
+        f"NDCG@20={r['best_validation_ndcg20']:.6f}"
+    )
+print('✅ UVCRec-MG-Attn complete.')
+
+# %% PUBLIC NOTEBOOK CELL 19
+# ==============================================================================
+# CELL 20 — TRAIN SAVREC — SEEDS 42 / 1 / 7
+# ==============================================================================
+# Proposed model. Same backbone-comparison batch size and common BPR protocol as
+# UVCRec-MG-Attn; the explicit observable-evidence modules are the intended
+# architectural addition.
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 20 — SAVREC THREE-SEED TRAINING')
+print('=' * 100)
+
+SAVREC_RUNS = []
+
+for seed in SEEDS:
+    print(f'\n--- SAVRec | seed={seed} ---')
+    meta = train_bpr_seed(
+        model_name='SAVRec',
+        ctor=MODEL_CTORS['SAVRec'],
+        seed=seed,
+        weight_decay=MODEL_WEIGHT_DECAY['SAVRec'],
+        batch_size=SAVREC_BATCH_SIZE,
+        max_epochs=MAX_EPOCHS,
+        patience=PATIENCE,
+        checkpoint_dir=CHECKPOINT_DIR,
+    )
+    SAVREC_RUNS.append(meta)
+
+MAIN_TRAINING_META['SAVRec'] = SAVREC_RUNS
+
+print('\nBest validation user-NDCG@20 by seed:')
+for r in SAVREC_RUNS:
+    print(
+        f"  seed={r['seed']} | epoch={r['best_epoch']} | "
+        f"NDCG@20={r['best_validation_ndcg20']:.6f}"
+    )
+print('✅ SAVRec complete.')
+
+# %% PUBLIC NOTEBOOK CELL 20
+# ==============================================================================
+# CELL 21 — MAIN TRAINING SUMMARY + CHECKPOINT / METADATA AUDIT
+# ==============================================================================
+# This cell is deliberately VALIDATION-ONLY. It never evaluates test_df.
+# It reloads every saved metadata/checkpoint from disk, verifies compatibility,
+# summarizes three-seed validation results, hashes checkpoints, and writes a
+# reproducibility manifest.
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 21 — MAIN TRAINING SUMMARY / CHECKPOINT AUDIT')
+print('=' * 100)
+
+import hashlib
+
+MAIN_MODELS = [
+    'LightGCN',
+    'Text-Only',
+    'VBPR',
+    'UVCRec-MG-Attn',
+    'SAVRec',
+]
+METRICS = ['HR@10', 'HR@20', 'NDCG@10', 'NDCG@20', 'MRR@20']
+
+
+def safe_model_name(name):
+    return name.lower().replace(' ', '_').replace('-', '_')
+
+
+def sha256_file(path, chunk_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            block = f.read(chunk_size)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+per_seed_rows = []
+checkpoint_manifest = []
+loaded_meta = {}
+
+for model_name in MAIN_MODELS:
+    safe = safe_model_name(model_name)
+    loaded_meta[model_name] = []
+
+    for seed in SEEDS:
+        json_path = os.path.join(CHECKPOINT_DIR, f'best_{safe}_seed_{seed}.json')
+        pt_path = os.path.join(CHECKPOINT_DIR, f'best_{safe}_seed_{seed}.pt')
+
+        assert os.path.exists(json_path), f'Missing metadata: {json_path}'
+        assert os.path.exists(pt_path), f'Missing checkpoint: {pt_path}'
+
+        with open(json_path, 'r') as f:
+            meta = json.load(f)
+
+        # ----------------------------------------------------------------------
+        # Metadata integrity
+        # ----------------------------------------------------------------------
+        assert meta['model'] == model_name, (model_name, meta['model'])
+        assert int(meta['seed']) == int(seed)
+        assert meta['test_used_for_selection'] is False
+        assert int(meta['selection_validation_users']) == int(
+            selection_val_df['user_id'].astype(str).nunique()
+        )
+        assert int(meta['selection_validation_interactions']) == int(
+            len(selection_val_df)
+        )
+        assert abs(float(meta['weight_decay']) - float(MODEL_WEIGHT_DECAY[model_name])) < 1e-15
+        assert 1 <= int(meta['best_epoch']) <= int(MAX_EPOCHS)
+        assert 0.0 <= float(meta['best_validation_ndcg20']) <= 1.0
+
+        if model_name != 'BM3':
+            assert meta.get('negative_sampling') == 'uniform_unseen_train'
+            assert meta.get('data_rng_isolated_from_model_rng') is True
+        else:
+            assert meta.get('training_objective') == 'compact_local_bm3_ssl_reimplementation'
+
+        # No test metric may have been written by training.
+        forbidden_test_metric_keys = [
+            k for k in meta.keys()
+            if k.startswith('test_') and k != 'test_used_for_selection'
+        ]
+        assert not forbidden_test_metric_keys, (
+            model_name, seed, forbidden_test_metric_keys
+        )
+
+        # ----------------------------------------------------------------------
+        # Checkpoint architecture compatibility — key/shape exactness
+        # ----------------------------------------------------------------------
+        state = torch.load(pt_path, map_location='cpu', weights_only=True)
+        reference_model = MODEL_CTORS[model_name]()
+        reference_state = reference_model.state_dict()
+
+        assert set(state.keys()) == set(reference_state.keys()), (
+            f'{model_name} seed={seed}: checkpoint key mismatch'
+        )
+        for key in state:
+            assert tuple(state[key].shape) == tuple(reference_state[key].shape), (
+                model_name, seed, key, state[key].shape, reference_state[key].shape
+            )
+
+        del reference_model, reference_state, state
+        gc.collect()
+
+        metrics = meta['best_validation_metrics']
+        row = {
+            'model': model_name,
+            'seed': int(seed),
+            'best_epoch': int(meta['best_epoch']),
+            'weight_decay': float(meta['weight_decay']),
+            'batch_size': int(meta['batch_size']),
+            'best_validation_ndcg20': float(meta['best_validation_ndcg20']),
+        }
+        for metric in METRICS:
+            value = float(metrics[metric])
+            assert 0.0 <= value <= 1.0
+            row[metric] = value
+
+        per_seed_rows.append(row)
+        loaded_meta[model_name].append(meta)
+        checkpoint_manifest.append({
+            'model': model_name,
+            'seed': int(seed),
+            'checkpoint': pt_path,
+            'metadata': json_path,
+            'checkpoint_sha256': sha256_file(pt_path),
+            'best_epoch': int(meta['best_epoch']),
+            'best_validation_ndcg20': float(meta['best_validation_ndcg20']),
+        })
+
+per_seed_df = pd.DataFrame(per_seed_rows)
+assert len(per_seed_df) == len(MAIN_MODELS) * len(SEEDS)
+
+# ------------------------------------------------------------------------------
+# Mean ± SD validation summary
+# ------------------------------------------------------------------------------
+summary_rows = []
+
+# Non-trainable validation baseline first.
+mp_row = {
+    'model': 'Most-Popular',
+    'seeds': 0,
+    'best_epoch_mean': np.nan,
+}
+for metric in METRICS:
+    mp_row[f'{metric}_mean'] = float(MOST_POPULAR_VAL[metric])
+    mp_row[f'{metric}_sd'] = 0.0
+summary_rows.append(mp_row)
+
+for model_name in MAIN_MODELS:
+    d = per_seed_df[per_seed_df['model'] == model_name].copy()
+    assert list(d['seed']) == SEEDS
+
+    row = {
+        'model': model_name,
+        'seeds': len(d),
+        'best_epoch_mean': float(d['best_epoch'].mean()),
+    }
+    for metric in METRICS:
+        vals = d[metric].astype(float).to_numpy()
+        row[f'{metric}_mean'] = float(vals.mean())
+        row[f'{metric}_sd'] = float(vals.std(ddof=1))
+    summary_rows.append(row)
+
+validation_summary_df = pd.DataFrame(summary_rows)
+validation_ranking_df = validation_summary_df.sort_values(
+    'NDCG@20_mean', ascending=False
+).reset_index(drop=True)
+
+# ------------------------------------------------------------------------------
+# Save validation-only outputs
+# ------------------------------------------------------------------------------
+per_seed_path = os.path.join(RESULT_DIR, 'main_training_validation_per_seed_v7.csv')
+summary_path = os.path.join(RESULT_DIR, 'main_training_validation_mean_sd_v7.csv')
+ranking_path = os.path.join(RESULT_DIR, 'main_training_validation_ranking_v7.csv')
+manifest_path = os.path.join(ARTIFACT_DIR, 'main_training_checkpoint_manifest_v7.json')
+
+per_seed_df.to_csv(per_seed_path, index=False)
+validation_summary_df.to_csv(summary_path, index=False)
+validation_ranking_df.to_csv(ranking_path, index=False)
+
+summary_records_for_json = []
+for rec in validation_summary_df.to_dict(orient='records'):
+    clean_rec = {}
+    for key, value in rec.items():
+        if isinstance(value, float) and np.isnan(value):
+            clean_rec[key] = None
+        elif isinstance(value, (np.floating, np.integer)):
+            clean_rec[key] = value.item()
+        else:
+            clean_rec[key] = value
+    summary_records_for_json.append(clean_rec)
+
+with open(manifest_path, 'w') as f:
+    json.dump(
+        {
+            'protocol': MAIN_TRAINING_PROTOCOL,
+            'checkpoints': checkpoint_manifest,
+            'validation_only_summary': summary_records_for_json,
+            'test_metrics_computed': False,
+        },
+        f,
+        indent=2,
+        allow_nan=False,
+    )
+
+print('\nPER-SEED VALIDATION RESULTS')
+display(per_seed_df.sort_values(['model', 'seed']).reset_index(drop=True))
+
+print('\nVALIDATION MEAN ± SD / RANKING')
+display(
+    validation_ranking_df[
+        [
+            'model',
+            'HR@10_mean', 'HR@10_sd',
+            'NDCG@10_mean', 'NDCG@10_sd',
+            'HR@20_mean', 'HR@20_sd',
+            'NDCG@20_mean', 'NDCG@20_sd',
+            'MRR@20_mean', 'MRR@20_sd',
+        ]
+    ]
+)
+
+print('\nSaved:')
+print('  ', per_seed_path)
+print('  ', summary_path)
+print('  ', ranking_path)
+print('  ', manifest_path)
+
+print('\n✅ All 15 final-main-model checkpoints (5 models × 3 seeds) exist,')
+print('   match the frozen architectures, and were selected using validation only.')
+print('✅ No test metric was computed in Cells 13–21.')
+print('=' * 100)
+
+
+# %% PUBLIC NOTEBOOK CELL 22
+# ==============================================================================
+# CELL 22 — REFERENCE-FAITHFUL BASELINES — FIXED DEFINITIONS + SEARCH SPACE
+# ==============================================================================
+# Replaces the previous Cells 22–27 reference-baseline stage.
+#
+# Goals:
+#   1) Preserve the cleaned/frozen SAVRec benchmark and evaluator.
+#   2) Use reference-faithful MMGCN, BM3, and SMORE mechanics.
+#   3) Fix SMORE cl_loss to the released value 0.01.
+#   4) Tune baseline hyperparameters on VALIDATION ONLY with a separate
+#      tuning seed (2026), then lock them before the final seeds [42,1,7].
+#   5) Never touch the historical test split in these cells.
+#   6) Never overwrite the earlier compact/development checkpoints.
+
+import os
+import gc
+import json
+import math
+import copy
+import hashlib
+import itertools
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+print('=' * 100)
+print('CELL 22 — REFERENCE-FAITHFUL BASELINES: FIXED DEFINITIONS + SEARCH SPACE')
+print('=' * 100)
+
+_required = [
+    'train_df', 'val_df', 'test_df',
+    'num_users', 'num_items', 'sbert_tensor', 'hotel_mean', 'sparse_adj',
+    'train_users', 'train_items', 'SEEDS', 'DEVICE', 'EMBED_DIM',
+    'TRAIN_BATCH_SIZE', 'VAL_BATCH_SIZE', 'MAX_EPOCHS', 'PATIENCE',
+    'MIN_DELTA', 'GRAD_CLIP', 'selection_val_df',
+    'evaluate_model_v6', 'make_data_generators', 'sample_uniform_negatives',
+    'set_global_seed', 'cpu_state_dict', 'CHECKPOINT_DIR', 'RESULT_DIR', 'ARTIFACT_DIR',
+    'IMAGE_DIM', 'TEXT_DIM'
+]
+_missing = [x for x in _required if x not in globals()]
+if _missing:
+    raise RuntimeError('Run the frozen / corrected Cells 1–21 first. Missing: ' + ', '.join(_missing))
+
+assert num_users == 264_584
+assert num_items == 3_322
+assert len(train_df) == 265_003
+assert len(val_df) == 9_045
+assert len(test_df) == 1_098
+assert SEEDS == [42, 1, 7]
+assert EMBED_DIM == 64
+assert len(selection_val_df) == len(val_df)
+assert selection_val_df['user_id'].astype(str).nunique() == len(selection_val_df)
+
+REFERENCE_IMPLEMENTATION_VERSION = 'savrec_v7_reference_tuned_v3'
+TUNING_SEED = 2026
+
+# Reference/MMRec common training defaults.
+# The benchmark/evaluator remain fixed, while external reference baselines
+# receive the released framework's common training budget.
+REFERENCE_BATCH_SIZE = 2048
+REFERENCE_MAX_EPOCHS = 1000
+REFERENCE_PATIENCE = 20
+REFERENCE_GRAD_CLIP = None
+
+TUNING_MAX_EPOCHS = REFERENCE_MAX_EPOCHS
+TUNING_PATIENCE = REFERENCE_PATIENCE
+
+# ------------------------------------------------------------------------------
+# Released/reference base settings and official-range search values.
+# ------------------------------------------------------------------------------
+REFERENCE_BASE_CONFIG = {
+    'MMGCN-Ref': {
+        'embedding_size': 64,
+        'reg_weight': 1e-4,
+        'learning_rate': 1e-3,
+        'concat': True,
+        'visual_latent_dim': 256,
+        'optimizer': 'Adam',
+        'optimizer_weight_decay': 0.0,
+    },
+    'BM3-Ref': {
+        'embedding_size': 64,
+        'n_layers': 1,
+        'dropout': 0.5,
+        'reg_weight': 0.01,
+        'cl_weight': 2.0,
+        'learning_rate': 1e-3,
+        'optimizer': 'Adam',
+        'optimizer_weight_decay': 0.0,
+        'negative_sampling': False,
+    },
+    'SMORE': {
+        'embedding_size': 64,
+        'n_ui_layers': 3,
+        'n_layers': 1,
+        'image_knn_k': 10,
+        'text_knn_k': 10,
+        'reg_weight': 1e-4,
+        'cl_loss': 0.01,          # FIXED: released SMORE value
+        'temperature': 0.2,
+        'dropout_rate': 0.0,
+        'learning_rate': 1e-3,
+        'lr_scheduler_base': 0.96,
+        'lr_scheduler_period': 50.0,
+        'optimizer': 'Adam',
+        'optimizer_weight_decay': 0.0,
+    },
+}
+
+REFERENCE_SEARCH_SPACE = {
+    'MMGCN-Ref': {
+        # Released MMRec MMGCN.yaml ranges.
+        'learning_rate': [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
+        'reg_weight': [0.0, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1],
+        # Deterministic coordinate search: LR first, then reg at best LR.
+        'strategy': 'coordinate_official_range',
+    },
+    'BM3-Ref': {
+        # Released MMRec BM3.yaml ranges; LR remains overall MMRec default 1e-3.
+        'n_layers': [1, 2],
+        'dropout': [0.3, 0.5],
+        'reg_weight': [0.1, 0.01],
+        'strategy': 'full_cartesian_official_range',
+    },
+    'SMORE': {
+        # Released MMRec SMORE.yaml ranges.
+        'n_ui_layers': [3, 4],
+        'image_knn_k': [10, 15, 20, 40],
+        'text_knn_k': [10, 15, 20, 40],
+        'reg_weight': [1e-5, 1e-4],
+        'dropout_rate': [0.0, 0.1],
+        'cl_loss': [0.01],
+        # Deterministic coordinate search: every released value of each
+        # dimension is compared while the other dimensions are held fixed.
+        'strategy': 'coordinate_all_released_values',
+    },
+}
+
+REFERENCE_TUNING_DIR = os.path.join(ARTIFACT_DIR, 'reference_tuning_v3')
+REFERENCE_FINAL_DIR = os.path.join(CHECKPOINT_DIR, 'reference_final_v3')
+os.makedirs(REFERENCE_TUNING_DIR, exist_ok=True)
+os.makedirs(REFERENCE_FINAL_DIR, exist_ok=True)
+
+
+def _jsonable_cfg(cfg):
+    out = {}
+    for k, v in cfg.items():
+        if isinstance(v, (np.integer, np.floating)):
+            out[k] = v.item()
+        else:
+            out[k] = v
+    return out
+
+
+def _cfg_signature(model_name, cfg, seed):
+    payload = {
+        'implementation_version': REFERENCE_IMPLEMENTATION_VERSION,
+        'model': model_name,
+        'seed': int(seed),
+        'config': _jsonable_cfg(cfg),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+# ------------------------------------------------------------------------------
+# Common reference graph utilities.
+# ------------------------------------------------------------------------------
+def _make_unweighted_bipartite_edge_buffers():
+    """Released MMGCN uses symmetric unweighted user-item edges + mean aggregation."""
+    u = train_users.detach().long()
+    i = train_items.detach().long() + num_users
+    src = torch.cat([u, i], dim=0)
+    dst = torch.cat([i, u], dim=0)
+    deg = torch.zeros(num_users + num_items, dtype=torch.float32, device=DEVICE)
+    deg.index_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
+    deg.clamp_min_(1.0)
+    return src, dst, deg
+
+
+REF_EDGE_SRC, REF_EDGE_DST, REF_EDGE_DEG = _make_unweighted_bipartite_edge_buffers()
+
+
+def _extract_normalized_user_item_block():
+    """Top-right user-item block of the frozen symmetric-normalized graph."""
+    A = sparse_adj.coalesce()
+    idx = A.indices()
+    val = A.values()
+    mask = (idx[0] < num_users) & (idx[1] >= num_users)
+    ui_idx = torch.stack([idx[0, mask], idx[1, mask] - num_users], dim=0)
+    ui_val = val[mask]
+    out = torch.sparse_coo_tensor(
+        ui_idx, ui_val, (num_users, num_items), device=DEVICE
+    ).coalesce()
+    assert out._nnz() == len(train_df)
+    return out
+
+
+REF_R_NORM = _extract_normalized_user_item_block()
+
+
+def _build_knn_normalized_graph(features, topk):
+    """MMRec/SMORE-style cosine top-k graph + symmetric degree normalization."""
+    with torch.no_grad():
+        feat = F.normalize(features.detach().float(), p=2, dim=-1)
+        sim = feat @ feat.T
+        knn_val, knn_ind = torch.topk(sim, k=int(topk), dim=-1)
+        n = feat.shape[0]
+        row = torch.arange(n, device=feat.device).repeat_interleave(int(topk))
+        col = knn_ind.reshape(-1)
+        weight = knn_val.reshape(-1)
+        deg = torch.zeros(n, dtype=weight.dtype, device=weight.device)
+        deg.index_add_(0, row, weight)
+        inv_sqrt = deg.clamp_min(1e-12).pow(-0.5)
+        weight = inv_sqrt[row] * weight * inv_sqrt[col]
+        graph = torch.sparse_coo_tensor(
+            torch.stack([row, col], dim=0), weight, (n, n), device=feat.device
+        ).coalesce()
+        del sim
+        return graph
+
+
+def _sparse_max_fusion(a, b):
+    """Elementwise max over the union of two sparse KNN graphs."""
+    a = a.coalesce()
+    b = b.coalesce()
+    edge_max = {}
+    for graph in (a, b):
+        ij = graph.indices().detach().cpu().numpy()
+        vv = graph.values().detach().cpu().numpy()
+        for k in range(vv.shape[0]):
+            key = (int(ij[0, k]), int(ij[1, k]))
+            value = float(vv[k])
+            old = edge_max.get(key)
+            if old is None or value > old:
+                edge_max[key] = value
+    keys = list(edge_max.keys())
+    rows = torch.tensor([x[0] for x in keys], dtype=torch.long, device=DEVICE)
+    cols = torch.tensor([x[1] for x in keys], dtype=torch.long, device=DEVICE)
+    vals = torch.tensor([edge_max[x] for x in keys], dtype=torch.float32, device=DEVICE)
+    return torch.sparse_coo_tensor(
+        torch.stack([rows, cols], dim=0), vals, a.shape, device=DEVICE
+    ).coalesce()
+
+
+_SMORE_GRAPH_CACHE = {}
+
+def _get_smore_graphs(image_k, text_k):
+    key = (int(image_k), int(text_k))
+    if key not in _SMORE_GRAPH_CACHE:
+        print(f'  building SMORE KNN graphs for image_k={key[0]}, text_k={key[1]}')
+        img = _build_knn_normalized_graph(hotel_mean, key[0])
+        txt = _build_knn_normalized_graph(sbert_tensor, key[1])
+        fus = _sparse_max_fusion(img, txt)
+        _SMORE_GRAPH_CACHE[key] = (img, txt, fus)
+    return _SMORE_GRAPH_CACHE[key]
+
+
+# ==============================================================================
+# MMGCN reference-faithful adaptation
+# ==============================================================================
+class _MMGCNMeanConv(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_dim, out_dim))
+        nn.init.xavier_normal_(self.weight)
+
+    def forward(self, x, src, dst, degree):
+        z = x @ self.weight
+        out = torch.zeros((z.shape[0], z.shape[1]), dtype=z.dtype, device=z.device)
+        out.index_add_(0, dst, z[src])
+        return out / degree.unsqueeze(-1)
+
+
+class _MMGCNBranch(nn.Module):
+    def __init__(self, feature_dim, id_dim, latent_dim=None, concat=True):
+        super().__init__()
+        self.concat = bool(concat)
+        initial_dim = int(latent_dim) if latent_dim is not None else int(feature_dim)
+        self.preference = nn.Parameter(torch.empty(num_users, initial_dim))
+        nn.init.xavier_normal_(self.preference)
+        self.mlp = nn.Linear(feature_dim, latent_dim) if latent_dim is not None else None
+
+        self.conv1 = _MMGCNMeanConv(initial_dim, initial_dim)
+        self.linear1 = nn.Linear(initial_dim, id_dim)
+        self.g1 = nn.Linear(initial_dim + id_dim, id_dim) if self.concat else nn.Linear(initial_dim, id_dim)
+
+        self.conv2 = _MMGCNMeanConv(id_dim, id_dim)
+        self.linear2 = nn.Linear(id_dim, id_dim)
+        self.g2 = nn.Linear(id_dim + id_dim, id_dim) if self.concat else nn.Linear(id_dim, id_dim)
+
+        self.conv3 = _MMGCNMeanConv(id_dim, id_dim)
+        self.linear3 = nn.Linear(id_dim, id_dim)
+        self.g3 = nn.Linear(id_dim + id_dim, id_dim) if self.concat else nn.Linear(id_dim, id_dim)
+
+        for layer in [self.linear1, self.g1, self.linear2, self.g2, self.linear3, self.g3]:
+            nn.init.xavier_normal_(layer.weight)
+
+    def forward(self, features, id_embedding, src, dst, degree):
+        temp_features = self.mlp(features) if self.mlp is not None else features
+        x = F.normalize(torch.cat([self.preference, temp_features], dim=0), p=2, dim=-1)
+
+        h = F.leaky_relu(self.conv1(x, src, dst, degree))
+        x_hat = F.leaky_relu(self.linear1(x)) + id_embedding
+        x = (F.leaky_relu(self.g1(torch.cat([h, x_hat], dim=1)))
+             if self.concat else F.leaky_relu(self.g1(h) + x_hat))
+
+        h = F.leaky_relu(self.conv2(x, src, dst, degree))
+        x_hat = F.leaky_relu(self.linear2(x)) + id_embedding
+        x = (F.leaky_relu(self.g2(torch.cat([h, x_hat], dim=1)))
+             if self.concat else F.leaky_relu(self.g2(h) + x_hat))
+
+        h = F.leaky_relu(self.conv3(x, src, dst, degree))
+        x_hat = F.leaky_relu(self.linear3(x)) + id_embedding
+        x = (F.leaky_relu(self.g3(torch.cat([h, x_hat], dim=1)))
+             if self.concat else F.leaky_relu(self.g3(h) + x_hat))
+        return x
+
+
+class MMGCNReference(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        cfg = copy.deepcopy(config)
+        d = int(cfg['embedding_size'])
+        self.reg_weight = float(cfg['reg_weight'])
+        self.concat = bool(cfg['concat'])
+
+        self.register_buffer('text_feat', sbert_tensor.detach().clone())
+        self.register_buffer('visual_feat', hotel_mean.detach().clone())
+        self.register_buffer('edge_src', REF_EDGE_SRC.detach().clone())
+        self.register_buffer('edge_dst', REF_EDGE_DST.detach().clone())
+        self.register_buffer('edge_degree', REF_EDGE_DEG.detach().clone())
+
+        self.visual_gcn = _MMGCNBranch(
+            IMAGE_DIM, d, latent_dim=int(cfg['visual_latent_dim']), concat=self.concat
+        )
+        self.text_gcn = _MMGCNBranch(
+            TEXT_DIM, d, latent_dim=None, concat=self.concat
+        )
+        self.id_embedding = nn.Parameter(torch.empty(num_users + num_items, d))
+        nn.init.xavier_normal_(self.id_embedding)
+
+    def forward_all(self):
+        v_rep = self.visual_gcn(
+            self.visual_feat, self.id_embedding, self.edge_src, self.edge_dst, self.edge_degree
+        )
+        t_rep = self.text_gcn(
+            self.text_feat, self.id_embedding, self.edge_src, self.edge_dst, self.edge_degree
+        )
+        return torch.split((v_rep + t_rep) / 2.0, [num_users, num_items], dim=0)
+
+    def calculate_loss(self, users, pos_items, neg_items):
+        u_all, i_all = self.forward_all()
+        u, p, n = u_all[users], i_all[pos_items], i_all[neg_items]
+        ranking_loss = -torch.log(
+            torch.sigmoid((u * p).sum(-1) - (u * n).sum(-1)) + 1e-10
+        ).mean()
+        # Match the released MMGCN regularizer exactly: duplicate each user for
+        # its positive/negative pair, interleave positive/negative item nodes,
+        # then average the summed squared ID embeddings.
+        pos_nodes = pos_items + num_users
+        neg_nodes = neg_items + num_users
+        user_tensor = users.repeat_interleave(2)
+        item_tensor = torch.stack([pos_nodes, neg_nodes], dim=1).reshape(-1)
+        reg_embedding_loss = (
+            self.id_embedding[user_tensor].pow(2)
+            + self.id_embedding[item_tensor].pow(2)
+        ).mean()
+        reg_embedding_loss = reg_embedding_loss + self.visual_gcn.preference.pow(2).mean()
+        return ranking_loss + self.reg_weight * reg_embedding_loss
+
+    def score_batch(self, users, items=None, catalog_matrix=None):
+        u_all, i_all = self.forward_all()
+        return u_all[users] @ i_all.T
+
+
+# ==============================================================================
+# BM3 official/MMRec-faithful adaptation
+# ==============================================================================
+class BM3Reference(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        cfg = copy.deepcopy(config)
+        d = int(cfg['embedding_size'])
+        self.n_layers = int(cfg['n_layers'])
+        self.reg_weight = float(cfg['reg_weight'])
+        self.cl_weight = float(cfg['cl_weight'])
+        self.dropout_rate = float(cfg['dropout'])
+
+        self.user_embedding = nn.Embedding(num_users, d)
+        self.item_id_embedding = nn.Embedding(num_items, d)
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        nn.init.xavier_uniform_(self.item_id_embedding.weight)
+
+        self.predictor = nn.Linear(d, d)
+        nn.init.xavier_normal_(self.predictor.weight)
+
+        self.text_embedding = nn.Embedding.from_pretrained(sbert_tensor.detach().clone(), freeze=False)
+        self.image_embedding = nn.Embedding.from_pretrained(hotel_mean.detach().clone(), freeze=False)
+        self.text_trs = nn.Linear(TEXT_DIM, d)
+        self.image_trs = nn.Linear(IMAGE_DIM, d)
+        nn.init.xavier_normal_(self.text_trs.weight)
+        nn.init.xavier_normal_(self.image_trs.weight)
+
+    def forward_graph(self):
+        h = self.item_id_embedding.weight
+        ego = torch.cat([self.user_embedding.weight, self.item_id_embedding.weight], dim=0)
+        all_embeddings = [ego]
+        for _ in range(self.n_layers):
+            ego = torch.sparse.mm(sparse_adj, ego)
+            all_embeddings.append(ego)
+        all_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1)
+        u, i = torch.split(all_embeddings, [num_users, num_items], dim=0)
+        return u, i + h
+
+    @staticmethod
+    def _emb_loss(*embeddings):
+        out = torch.zeros((), device=embeddings[-1].device)
+        for embedding in embeddings:
+            out = out + torch.norm(embedding, p=2)
+        return out / embeddings[-1].shape[0]
+
+    def calculate_loss(self, users, items):
+        u_online_ori, i_online_ori = self.forward_graph()
+        t_feat_online = self.text_trs(self.text_embedding.weight)
+        v_feat_online = self.image_trs(self.image_embedding.weight)
+
+        with torch.no_grad():
+            u_target = F.dropout(u_online_ori.detach().clone(), p=self.dropout_rate, training=True)
+            i_target = F.dropout(i_online_ori.detach().clone(), p=self.dropout_rate, training=True)
+            t_feat_target = F.dropout(t_feat_online.detach().clone(), p=self.dropout_rate, training=True)
+            v_feat_target = F.dropout(v_feat_online.detach().clone(), p=self.dropout_rate, training=True)
+
+        u_online = self.predictor(u_online_ori)[users]
+        i_online = self.predictor(i_online_ori)[items]
+        u_target_b, i_target_b = u_target[users], i_target[items]
+        t_feat_pred = self.predictor(t_feat_online)[items]
+        v_feat_pred = self.predictor(v_feat_online)[items]
+        t_feat_target_b, v_feat_target_b = t_feat_target[items], v_feat_target[items]
+
+        loss_ui = 1.0 - F.cosine_similarity(u_online, i_target_b.detach(), dim=-1).mean()
+        loss_iu = 1.0 - F.cosine_similarity(i_online, u_target_b.detach(), dim=-1).mean()
+        loss_t = 1.0 - F.cosine_similarity(t_feat_pred, i_target_b.detach(), dim=-1).mean()
+        loss_v = 1.0 - F.cosine_similarity(v_feat_pred, i_target_b.detach(), dim=-1).mean()
+        loss_tv = 1.0 - F.cosine_similarity(t_feat_pred, t_feat_target_b.detach(), dim=-1).mean()
+        loss_vt = 1.0 - F.cosine_similarity(v_feat_pred, v_feat_target_b.detach(), dim=-1).mean()
+        reg = self._emb_loss(u_online_ori, i_online_ori)
+
+        return (
+            loss_ui + loss_iu
+            + self.reg_weight * reg
+            + self.cl_weight * (loss_t + loss_v + loss_tv + loss_vt)
+        )
+
+    def score_batch(self, users, items=None, catalog_matrix=None):
+        u, i = self.forward_graph()
+        return self.predictor(u)[users] @ self.predictor(i).T
+
+
+# ==============================================================================
+# SMORE reference-faithful adaptation
+# ==============================================================================
+class SMOREReference(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        cfg = copy.deepcopy(config)
+        d = int(cfg['embedding_size'])
+        self.n_ui_layers = int(cfg['n_ui_layers'])
+        self.n_layers = int(cfg['n_layers'])
+        self.reg_weight = float(cfg['reg_weight'])
+        self.cl_loss_weight = float(cfg['cl_loss'])
+        self.temperature = float(cfg['temperature'])
+        self.dropout_rate = float(cfg['dropout_rate'])
+        self.batch_size = REFERENCE_BATCH_SIZE
+        self.dropout = nn.Dropout(p=self.dropout_rate)
+
+        self.user_embedding = nn.Embedding(num_users, d)
+        self.item_id_embedding = nn.Embedding(num_items, d)
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        nn.init.xavier_uniform_(self.item_id_embedding.weight)
+
+        self.image_embedding = nn.Embedding.from_pretrained(hotel_mean.detach().clone(), freeze=False)
+        self.text_embedding = nn.Embedding.from_pretrained(sbert_tensor.detach().clone(), freeze=False)
+        self.image_trs = nn.Linear(IMAGE_DIM, d)
+        self.text_trs = nn.Linear(TEXT_DIM, d)
+
+        self.query_v = nn.Sequential(nn.Linear(d, d), nn.Tanh(), nn.Linear(d, d, bias=False))
+        self.query_t = nn.Sequential(nn.Linear(d, d), nn.Tanh(), nn.Linear(d, d, bias=False))
+        self.softmax = nn.Softmax(dim=-1)
+
+        self.gate_v = nn.Sequential(nn.Linear(d, d), nn.Sigmoid())
+        self.gate_t = nn.Sequential(nn.Linear(d, d), nn.Sigmoid())
+        self.gate_f = nn.Sequential(nn.Linear(d, d), nn.Sigmoid())
+        self.gate_image_prefer = nn.Sequential(nn.Linear(d, d), nn.Sigmoid())
+        self.gate_text_prefer = nn.Sequential(nn.Linear(d, d), nn.Sigmoid())
+        self.gate_fusion_prefer = nn.Sequential(nn.Linear(d, d), nn.Sigmoid())
+
+        self.image_complex_weight = nn.Parameter(torch.randn(1, d // 2 + 1, 2))
+        self.text_complex_weight = nn.Parameter(torch.randn(1, d // 2 + 1, 2))
+        self.fusion_complex_weight = nn.Parameter(torch.randn(1, d // 2 + 1, 2))
+
+        image_adj, text_adj, fusion_adj = _get_smore_graphs(
+            cfg['image_knn_k'], cfg['text_knn_k']
+        )
+        self.register_buffer('image_original_adj', image_adj.detach().clone())
+        self.register_buffer('text_original_adj', text_adj.detach().clone())
+        self.register_buffer('fusion_adj', fusion_adj.detach().clone())
+        self.register_buffer('R_norm', REF_R_NORM.detach().clone())
+
+    def spectrum_convolution(self, image_embeds, text_embeds):
+        image_fft = torch.fft.rfft(image_embeds, dim=1, norm='ortho')
+        text_fft = torch.fft.rfft(text_embeds, dim=1, norm='ortho')
+        image_w = torch.view_as_complex(self.image_complex_weight)
+        text_w = torch.view_as_complex(self.text_complex_weight)
+        fusion_w = torch.view_as_complex(self.fusion_complex_weight)
+        image_conv = torch.fft.irfft(image_fft * image_w, n=image_embeds.shape[1], dim=1, norm='ortho')
+        text_conv = torch.fft.irfft(text_fft * text_w, n=text_embeds.shape[1], dim=1, norm='ortho')
+        fusion_conv = torch.fft.irfft(
+            text_fft * image_fft * fusion_w, n=text_embeds.shape[1], dim=1, norm='ortho'
+        )
+        return image_conv, text_conv, fusion_conv
+
+    def forward_all(self, train_mode=False):
+        image_feats = self.image_trs(self.image_embedding.weight)
+        text_feats = self.text_trs(self.text_embedding.weight)
+        image_conv, text_conv, fusion_conv = self.spectrum_convolution(image_feats, text_feats)
+
+        image_item = self.item_id_embedding.weight * self.gate_v(image_conv)
+        text_item = self.item_id_embedding.weight * self.gate_t(text_conv)
+        fusion_item = self.item_id_embedding.weight * self.gate_f(fusion_conv)
+
+        ego = torch.cat([self.user_embedding.weight, self.item_id_embedding.weight], dim=0)
+        all_embeddings = [ego]
+        for _ in range(self.n_ui_layers):
+            ego = torch.sparse.mm(sparse_adj, ego)
+            all_embeddings.append(ego)
+        content_embeds = torch.stack(all_embeddings, dim=1).mean(dim=1)
+
+        for _ in range(self.n_layers):
+            image_item = torch.sparse.mm(self.image_original_adj, image_item)
+            text_item = torch.sparse.mm(self.text_original_adj, text_item)
+            fusion_item = torch.sparse.mm(self.fusion_adj, fusion_item)
+
+        image_user = torch.sparse.mm(self.R_norm, image_item)
+        text_user = torch.sparse.mm(self.R_norm, text_item)
+        fusion_user = torch.sparse.mm(self.R_norm, fusion_item)
+
+        image_embeds = torch.cat([image_user, image_item], dim=0)
+        text_embeds = torch.cat([text_user, text_item], dim=0)
+        fusion_embeds = torch.cat([fusion_user, fusion_item], dim=0)
+
+        agg_image = self.softmax(self.query_v(fusion_embeds)) * image_embeds
+        agg_text = self.softmax(self.query_t(fusion_embeds)) * text_embeds
+
+        image_pref = self.dropout(self.gate_image_prefer(content_embeds))
+        text_pref = self.dropout(self.gate_text_prefer(content_embeds))
+        fusion_pref = self.dropout(self.gate_fusion_prefer(content_embeds))
+
+        agg_image = image_pref * agg_image
+        agg_text = text_pref * agg_text
+        fusion_embeds = fusion_pref * fusion_embeds
+
+        side_embeds = torch.stack([agg_image, agg_text, fusion_embeds], dim=0).mean(dim=0)
+        all_embeds = content_embeds + side_embeds
+        u, i = torch.split(all_embeds, [num_users, num_items], dim=0)
+        if train_mode:
+            return u, i, side_embeds, content_embeds
+        return u, i
+
+    @staticmethod
+    def _info_nce(view1, view2, temperature):
+        v1 = F.normalize(view1, dim=1)
+        v2 = F.normalize(view2, dim=1)
+        pos = torch.exp((v1 * v2).sum(dim=-1) / temperature)
+        ttl = torch.exp((v1 @ v2.T) / temperature).sum(dim=1)
+        return -torch.log(pos / ttl.clamp_min(1e-12)).mean()
+
+    def calculate_loss(self, users, pos_items, neg_items):
+        ua, ia, side, content = self.forward_all(train_mode=True)
+        u, p, n = ua[users], ia[pos_items], ia[neg_items]
+        mf_loss = -F.logsigmoid((u * p).sum(dim=1) - (u * n).sum(dim=1)).mean()
+        # Released SMORE divides this regularizer by the configured training
+        # batch size (not the size of the possibly-short final minibatch).
+        regularizer = 0.5 * (u.pow(2).sum() + p.pow(2).sum() + n.pow(2).sum()) / float(self.batch_size)
+        emb_loss = self.reg_weight * regularizer
+        side_u, side_i = torch.split(side, [num_users, num_items], dim=0)
+        content_u, content_i = torch.split(content, [num_users, num_items], dim=0)
+        cl = self._info_nce(side_i[pos_items], content_i[pos_items], self.temperature)
+        cl = cl + self._info_nce(side_u[users], content_u[users], self.temperature)
+        return mf_loss + emb_loss + self.cl_loss_weight * cl
+
+    def score_batch(self, users, items=None, catalog_matrix=None):
+        u, i = self.forward_all(train_mode=False)
+        return u[users] @ i.T
+
+
+def make_reference_model(model_name, config):
+    if model_name == 'MMGCN-Ref':
+        return MMGCNReference(config)
+    if model_name == 'BM3-Ref':
+        return BM3Reference(config)
+    if model_name == 'SMORE':
+        return SMOREReference(config)
+    raise KeyError(model_name)
+
+print('✅ Fixed reference model definitions loaded.')
+print('✅ SMORE cl_loss corrected to 0.01.')
+print('✅ Hyperparameter search spaces declared before any test evaluation.')
+print('✅ No test metric was computed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 23
+# ==============================================================================
+# CELL 23 — REFERENCE BASELINE PRE-TUNING AUDIT
+# ==============================================================================
+print('=' * 100)
+print('CELL 23 — REFERENCE BASELINE PRE-TUNING AUDIT')
+print('=' * 100)
+
+probe_users = torch.tensor([0, min(1, num_users - 1)], dtype=torch.long, device=DEVICE)
+probe_pos = train_items[:2]
+probe_neg = torch.tensor(
+    [(int(x) + 1) % num_items for x in probe_pos.detach().cpu().tolist()],
+    dtype=torch.long,
+    device=DEVICE,
+)
+
+for model_name in ['MMGCN-Ref', 'BM3-Ref', 'SMORE']:
+    set_global_seed(123456)
+    cfg = copy.deepcopy(REFERENCE_BASE_CONFIG[model_name])
+    model = make_reference_model(model_name, cfg).to(DEVICE)
+    model.eval()
+    with torch.no_grad():
+        scores = model.score_batch(probe_users)
+    assert scores.shape == (2, num_items), (model_name, scores.shape)
+    assert torch.isfinite(scores).all(), model_name
+
+    model.train()
+    if model_name == 'BM3-Ref':
+        loss = model.calculate_loss(probe_users, probe_pos)
+    else:
+        loss = model.calculate_loss(probe_users, probe_pos, probe_neg)
+    assert loss.ndim == 0 and torch.isfinite(loss), (model_name, loss)
+
+    params = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f'{model_name:<12} score={tuple(scores.shape)} '
+        f'params={params:,} trainable={trainable:,} loss={float(loss.detach()):.6f}'
+    )
+    del model, scores, loss
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+protocol_path_v2 = os.path.join(ARTIFACT_DIR, 'reference_baseline_tuning_protocol_v3.json')
+with open(protocol_path_v2, 'w') as f:
+    json.dump(
+        {
+            'created_utc': datetime.now(timezone.utc).isoformat(),
+            'implementation_version': REFERENCE_IMPLEMENTATION_VERSION,
+            'benchmark': {
+                'users': int(num_users),
+                'items': int(num_items),
+                'train_interactions': int(len(train_df)),
+                'validation_interactions': int(len(val_df)),
+                'historical_test_interactions': int(len(test_df)),
+            },
+            'tuning_seed': int(TUNING_SEED),
+            'reported_final_seeds': [int(x) for x in SEEDS],
+            'reference_batch_size': int(REFERENCE_BATCH_SIZE),
+            'reference_max_epochs': int(REFERENCE_MAX_EPOCHS),
+            'reference_patience': int(REFERENCE_PATIENCE),
+            'reference_grad_clip': REFERENCE_GRAD_CLIP,
+            'tuning_max_epochs': int(TUNING_MAX_EPOCHS),
+            'tuning_patience': int(TUNING_PATIENCE),
+            'selection_metric': 'user-NDCG@20',
+            'selection_split': 'validation',
+            'base_configs': REFERENCE_BASE_CONFIG,
+            'search_spaces': REFERENCE_SEARCH_SPACE,
+            'test_used_for_selection': False,
+            'test_metrics_computed': False,
+            'feature_policy': (
+                'Same benchmark-aligned SBERT hotel text and CLIP-derived hotel visual '
+                'features used for all reference multimodal baselines.'
+            ),
+            'search_policy': (
+                'Hyperparameters selected on validation only. MMGCN uses fixed-budget '
+                'coordinate search over released values; BM3 uses the full released '
+                '3-parameter Cartesian grid; SMORE uses deterministic coordinate search '
+                'covering every released value of each tuned dimension, with cl_loss '
+                'fixed to the released value 0.01.'
+            ),
+        },
+        f,
+        indent=2,
+    )
+
+print('Protocol:', protocol_path_v2)
+print('✅ Pre-tuning audit passed.')
+print('✅ Tuning seed 2026 is separate from final seeds [42,1,7].')
+print('✅ No test metric was computed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 24
+# ==============================================================================
+# CELL 24 — VALIDATION-ONLY TUNING + FINAL-TRAINING FRAMEWORK
+# ==============================================================================
+print('=' * 100)
+print('CELL 24 — VALIDATION-ONLY TUNING + FINAL-TRAINING FRAMEWORK')
+print('=' * 100)
+
+
+def _safe_name(name):
+    return name.lower().replace(' ', '_').replace('-', '_')
+
+
+def _trial_json_path(model_name, cfg, seed):
+    sig = _cfg_signature(model_name, cfg, seed)
+    return os.path.join(REFERENCE_TUNING_DIR, f'{_safe_name(model_name)}_{sig}.json')
+
+
+def _load_cached_trial(model_name, cfg, seed):
+    path = _trial_json_path(model_name, cfg, seed)
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r') as f:
+        meta = json.load(f)
+    if (
+        meta.get('implementation_version') == REFERENCE_IMPLEMENTATION_VERSION
+        and meta.get('model') == model_name
+        and int(meta.get('seed')) == int(seed)
+        and meta.get('config') == _jsonable_cfg(cfg)
+        and meta.get('test_metrics_computed') is False
+    ):
+        return meta
+    return None
+
+
+def run_reference_trial(
+    model_name,
+    cfg,
+    seed=TUNING_SEED,
+    max_epochs=TUNING_MAX_EPOCHS,
+    patience=TUNING_PATIENCE,
+    cache=True,
+    verbose=True,
+):
+    cfg = copy.deepcopy(cfg)
+    if cache:
+        cached = _load_cached_trial(model_name, cfg, seed)
+        if cached is not None:
+            if verbose:
+                print(
+                    f'[cached] {model_name} seed={seed} '
+                    f'best_ep={cached["best_epoch"]} '
+                    f'NDCG@20={cached["best_validation_ndcg20"]:.6f} '
+                    f'cfg={cfg}'
+                )
+            return cached
+
+    set_global_seed(seed)
+    model = make_reference_model(model_name, cfg).to(DEVICE)
+    perm_gen, neg_gen = make_data_generators(seed)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(cfg['learning_rate']),
+        weight_decay=float(cfg.get('optimizer_weight_decay', 0.0)),
+    )
+    scheduler = None
+    if model_name == 'SMORE':
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda ep: float(cfg['lr_scheduler_base']) ** (
+                ep / float(cfg['lr_scheduler_period'])
+            ),
+        )
+
+    best_ndcg = -1.0
+    best_epoch = None
+    best_metrics = None
+    stale = 0
+    history = []
+
+    for epoch in range(1, int(max_epochs) + 1):
+        model.train()
+        perm = torch.randperm(len(train_users), device=DEVICE, generator=perm_gen)
+        loss_sum, nb = 0.0, 0
+
+        for start in range(0, len(train_users), REFERENCE_BATCH_SIZE):
+            ids = perm[start:start + REFERENCE_BATCH_SIZE]
+            users = train_users[ids]
+            pos = train_items[ids]
+
+            if model_name == 'BM3-Ref':
+                loss = model.calculate_loss(users, pos)
+            else:
+                neg = sample_uniform_negatives(users, neg_gen)
+                loss = model.calculate_loss(users, pos, neg)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if REFERENCE_GRAD_CLIP is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float(REFERENCE_GRAD_CLIP)
+                )
+            optimizer.step()
+            loss_sum += float(loss.item())
+            nb += 1
+
+        if scheduler is not None:
+            scheduler.step()
+
+        model.eval()
+        with torch.no_grad():
+            vm = evaluate_model_v6(model, selection_val_df, batch_size=VAL_BATCH_SIZE)
+
+        row = {
+            'epoch': int(epoch),
+            'loss': float(loss_sum / max(nb, 1)),
+            'learning_rate': float(optimizer.param_groups[0]['lr']),
+            **{f'val_{k}': float(v) for k, v in vm.items()},
+        }
+        history.append(row)
+        if verbose:
+            print(
+                f'{model_name} tune seed={seed} ep={epoch:02d} '
+                f'loss={row["loss"]:.5f} Val NDCG@20={vm["NDCG@20"]:.6f}'
+            )
+
+        if vm['NDCG@20'] > best_ndcg + MIN_DELTA:
+            best_ndcg = float(vm['NDCG@20'])
+            best_epoch = int(epoch)
+            best_metrics = dict(vm)
+            stale = 0
+        else:
+            stale += 1
+            if stale >= int(patience):
+                break
+
+    meta = {
+        'implementation_version': REFERENCE_IMPLEMENTATION_VERSION,
+        'stage': 'validation_hyperparameter_tuning',
+        'model': model_name,
+        'seed': int(seed),
+        'config': _jsonable_cfg(cfg),
+        'best_epoch': int(best_epoch),
+        'best_validation_ndcg20': float(best_ndcg),
+        'best_validation_metrics': {k: float(v) for k, v in best_metrics.items()},
+        'selection_validation_users': int(selection_val_df['user_id'].astype(str).nunique()),
+        'selection_validation_interactions': int(len(selection_val_df)),
+        'negative_sampling': (
+            'none_official_positive_only_ssl' if model_name == 'BM3-Ref'
+            else 'uniform_unseen_train'
+        ),
+        'test_used_for_selection': False,
+        'test_metrics_computed': False,
+        'history': history,
+    }
+
+    if cache:
+        with open(_trial_json_path(model_name, cfg, seed), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return meta
+
+
+def _best_trial(trials):
+    assert trials
+    return max(trials, key=lambda x: float(x['best_validation_ndcg20']))
+
+
+def save_tuning_table(model_name, trials):
+    rows = []
+    for t in trials:
+        row = {
+            'model': model_name,
+            'seed': int(t['seed']),
+            'best_epoch': int(t['best_epoch']),
+            'best_validation_ndcg20': float(t['best_validation_ndcg20']),
+        }
+        row.update({f'cfg_{k}': v for k, v in t['config'].items()})
+        rows.append(row)
+    df = pd.DataFrame(rows).drop_duplicates()
+    path = os.path.join(RESULT_DIR, f'tuning_{_safe_name(model_name)}_v3.csv')
+    df.to_csv(path, index=False)
+    return df, path
+
+
+def _final_paths(model_name, seed):
+    safe = _safe_name(model_name)
+    pt_path = os.path.join(
+        REFERENCE_FINAL_DIR, f'best_{safe}_final_seed_{seed}.pt'
+    )
+    json_path = os.path.join(
+        REFERENCE_FINAL_DIR, f'best_{safe}_final_seed_{seed}.json'
+    )
+    return pt_path, json_path
+
+
+def _load_cached_final(model_name, cfg, seed):
+    pt_path, json_path = _final_paths(model_name, seed)
+    if not (os.path.exists(pt_path) and os.path.exists(json_path)):
+        return None
+    with open(json_path, 'r') as f:
+        meta = json.load(f)
+    valid = (
+        meta.get('implementation_version') == REFERENCE_IMPLEMENTATION_VERSION
+        and meta.get('stage') == 'final_three_seed_validation_training'
+        and meta.get('model') == model_name
+        and int(meta.get('seed')) == int(seed)
+        and meta.get('config') == _jsonable_cfg(cfg)
+        and meta.get('test_metrics_computed') is False
+        and meta.get('test_used_for_selection') is False
+    )
+    if valid:
+        print(
+            f'[cached final] {model_name} seed={seed} '
+            f'epoch={meta["best_epoch"]} '
+            f'NDCG@20={meta["best_validation_ndcg20"]:.6f}'
+        )
+        return meta
+    return None
+
+
+def train_reference_final_seed(model_name, cfg, seed):
+    cfg = copy.deepcopy(cfg)
+
+    cached = _load_cached_final(model_name, cfg, seed)
+    if cached is not None:
+        return cached
+
+    set_global_seed(seed)
+    model = make_reference_model(model_name, cfg).to(DEVICE)
+    perm_gen, neg_gen = make_data_generators(seed)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=float(cfg['learning_rate']),
+        weight_decay=float(cfg.get('optimizer_weight_decay', 0.0))
+    )
+    scheduler = None
+    if model_name == 'SMORE':
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda ep: float(cfg['lr_scheduler_base']) ** (
+                ep / float(cfg['lr_scheduler_period'])
+            ),
+        )
+
+    best_ndcg, best_epoch, best_state, best_metrics = -1.0, None, None, None
+    stale, history = 0, []
+
+    for epoch in range(1, REFERENCE_MAX_EPOCHS + 1):
+        model.train()
+        perm = torch.randperm(len(train_users), device=DEVICE, generator=perm_gen)
+        loss_sum, nb = 0.0, 0
+        for start in range(0, len(train_users), REFERENCE_BATCH_SIZE):
+            ids = perm[start:start + REFERENCE_BATCH_SIZE]
+            users, pos = train_users[ids], train_items[ids]
+            if model_name == 'BM3-Ref':
+                loss = model.calculate_loss(users, pos)
+            else:
+                neg = sample_uniform_negatives(users, neg_gen)
+                loss = model.calculate_loss(users, pos, neg)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if REFERENCE_GRAD_CLIP is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), float(REFERENCE_GRAD_CLIP)
+                )
+            optimizer.step()
+            loss_sum += float(loss.item())
+            nb += 1
+
+        if scheduler is not None:
+            scheduler.step()
+
+        model.eval()
+        with torch.no_grad():
+            vm = evaluate_model_v6(model, selection_val_df, batch_size=VAL_BATCH_SIZE)
+        row = {
+            'epoch': int(epoch), 'loss': float(loss_sum / max(nb, 1)),
+            'learning_rate': float(optimizer.param_groups[0]['lr']),
+            **{f'val_{k}': float(v) for k, v in vm.items()},
+        }
+        history.append(row)
+        print(
+            f'{model_name} FINAL seed={seed} ep={epoch:02d} '
+            f'loss={row["loss"]:.5f} Val user-NDCG@20={vm["NDCG@20"]:.6f}'
+        )
+
+        if vm['NDCG@20'] > best_ndcg + MIN_DELTA:
+            best_ndcg = float(vm['NDCG@20'])
+            best_epoch = int(epoch)
+            best_state = cpu_state_dict(model)
+            best_metrics = dict(vm)
+            stale = 0
+        else:
+            stale += 1
+            if stale >= REFERENCE_PATIENCE:
+                break
+
+    pt_path, json_path = _final_paths(model_name, seed)
+    torch.save(best_state, pt_path)
+    meta = {
+        'implementation_version': REFERENCE_IMPLEMENTATION_VERSION,
+        'stage': 'final_three_seed_validation_training',
+        'model': model_name,
+        'seed': int(seed),
+        'config': _jsonable_cfg(cfg),
+        'batch_size': int(REFERENCE_BATCH_SIZE),
+        'max_epochs': int(REFERENCE_MAX_EPOCHS),
+        'patience': int(REFERENCE_PATIENCE),
+        'hyperparameters_selected_on_validation': True,
+        'hyperparameter_tuning_seed': int(TUNING_SEED),
+        'best_epoch': int(best_epoch),
+        'best_validation_ndcg20': float(best_ndcg),
+        'best_validation_metrics': {k: float(v) for k, v in best_metrics.items()},
+        'selection_validation_users': int(selection_val_df['user_id'].astype(str).nunique()),
+        'selection_validation_interactions': int(len(selection_val_df)),
+        'negative_sampling': (
+            'none_official_positive_only_ssl' if model_name == 'BM3-Ref'
+            else 'uniform_unseen_train'
+        ),
+        'test_used_for_selection': False,
+        'test_metrics_computed': False,
+        'checkpoint': pt_path,
+        'history': history,
+    }
+    with open(json_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return meta
+
+print('✅ Tuning/final-training framework ready.')
+print('✅ Tuning-trial and final-seed caches enabled.')
+print(
+    f'✅ Reference training budget: batch={REFERENCE_BATCH_SIZE}, '
+    f'max_epochs={REFERENCE_MAX_EPOCHS}, patience={REFERENCE_PATIENCE}.'
+)
+print('✅ Test split remains unused.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 25
+# ==============================================================================
+# CELL 25 — TUNE MMGCN-REF — OFFICIAL-RANGE COORDINATE SEARCH
+# ==============================================================================
+print('=' * 100)
+print('CELL 25 — TUNE MMGCN-REF')
+print('=' * 100)
+
+model_name = 'MMGCN-Ref'
+base = copy.deepcopy(REFERENCE_BASE_CONFIG[model_name])
+trials = []
+
+# Stage A: search all released learning-rate values at reg=1e-4.
+for lr in REFERENCE_SEARCH_SPACE[model_name]['learning_rate']:
+    cfg = copy.deepcopy(base)
+    cfg['learning_rate'] = float(lr)
+    cfg['reg_weight'] = 1e-4
+    print(f'\n[MMGCN Stage A] lr={lr:g}, reg=1e-4')
+    trials.append(run_reference_trial(model_name, cfg))
+
+stage_a_best = _best_trial(trials)
+best_lr = float(stage_a_best['config']['learning_rate'])
+print(f'\nStage A best learning rate: {best_lr:g}')
+
+# Stage B: search all released regularization values at the best LR.
+for reg in REFERENCE_SEARCH_SPACE[model_name]['reg_weight']:
+    cfg = copy.deepcopy(base)
+    cfg['learning_rate'] = best_lr
+    cfg['reg_weight'] = float(reg)
+    print(f'\n[MMGCN Stage B] lr={best_lr:g}, reg={reg:g}')
+    trials.append(run_reference_trial(model_name, cfg))
+
+# De-duplicate cached overlap and choose the best validation trial.
+unique = {}
+for t in trials:
+    key = json.dumps(t['config'], sort_keys=True)
+    unique[key] = t
+trials = list(unique.values())
+MMGCN_TUNING_BEST = _best_trial(trials)
+MMGCN_SELECTED_CONFIG = copy.deepcopy(MMGCN_TUNING_BEST['config'])
+
+mmgcn_df, mmgcn_tuning_path = save_tuning_table(model_name, trials)
+mmgcn_sel_path = os.path.join(ARTIFACT_DIR, 'selected_mmgcn_ref_config_v3.json')
+with open(mmgcn_sel_path, 'w') as f:
+    json.dump(MMGCN_TUNING_BEST, f, indent=2)
+
+print('\nMMGCN selected config:')
+print(json.dumps(MMGCN_SELECTED_CONFIG, indent=2))
+print(f'Best tuning NDCG@20: {MMGCN_TUNING_BEST["best_validation_ndcg20"]:.6f}')
+print('Tuning CSV:', mmgcn_tuning_path)
+print('Selected JSON:', mmgcn_sel_path)
+print('✅ MMGCN tuning complete. No test metric computed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 26
+# ==============================================================================
+# CELL 26 — TUNE BM3-REF — FULL RELEASED CARTESIAN GRID
+# ==============================================================================
+print('=' * 100)
+print('CELL 26 — TUNE BM3-REF')
+print('=' * 100)
+
+model_name = 'BM3-Ref'
+base = copy.deepcopy(REFERENCE_BASE_CONFIG[model_name])
+trials = []
+space = REFERENCE_SEARCH_SPACE[model_name]
+
+for n_layers, dropout, reg in itertools.product(
+    space['n_layers'], space['dropout'], space['reg_weight']
+):
+    cfg = copy.deepcopy(base)
+    cfg['n_layers'] = int(n_layers)
+    cfg['dropout'] = float(dropout)
+    cfg['reg_weight'] = float(reg)
+    print(
+        f'\n[BM3 grid] layers={n_layers}, dropout={dropout:g}, reg={reg:g}, '
+        f'lr={cfg["learning_rate"]:g}'
+    )
+    trials.append(run_reference_trial(model_name, cfg))
+
+BM3_TUNING_BEST = _best_trial(trials)
+BM3_SELECTED_CONFIG = copy.deepcopy(BM3_TUNING_BEST['config'])
+bm3_df, bm3_tuning_path = save_tuning_table(model_name, trials)
+bm3_sel_path = os.path.join(ARTIFACT_DIR, 'selected_bm3_ref_config_v3.json')
+with open(bm3_sel_path, 'w') as f:
+    json.dump(BM3_TUNING_BEST, f, indent=2)
+
+print('\nBM3 selected config:')
+print(json.dumps(BM3_SELECTED_CONFIG, indent=2))
+print(f'Best tuning NDCG@20: {BM3_TUNING_BEST["best_validation_ndcg20"]:.6f}')
+print('Tuning CSV:', bm3_tuning_path)
+print('Selected JSON:', bm3_sel_path)
+print('✅ BM3 tuning complete. No test metric computed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 27
+# ==============================================================================
+# CELL 27 — TUNE SMORE — CORRECT cl_loss + DETERMINISTIC OFFICIAL-VALUE COORDINATE SEARCH
+# ==============================================================================
+print('=' * 100)
+print('CELL 27 — TUNE SMORE')
+print('=' * 100)
+
+model_name = 'SMORE'
+base = copy.deepcopy(REFERENCE_BASE_CONFIG[model_name])
+assert abs(float(base['cl_loss']) - 0.01) < 1e-15
+trials = []
+space = REFERENCE_SEARCH_SPACE[model_name]
+
+# Stage A: number of behavioral UI layers.
+for n_ui in space['n_ui_layers']:
+    cfg = copy.deepcopy(base)
+    cfg['n_ui_layers'] = int(n_ui)
+    print(f'\n[SMORE Stage A] n_ui_layers={n_ui}')
+    trials.append(run_reference_trial(model_name, cfg))
+
+best_a = _best_trial(trials)
+working = copy.deepcopy(best_a['config'])
+
+# Stage B: image-KNN size — test every released value.
+image_trials = []
+for image_k in space['image_knn_k']:
+    cfg = copy.deepcopy(working)
+    cfg['image_knn_k'] = int(image_k)
+    print(f'\n[SMORE Stage B] image_k={image_k}, text_k={cfg["text_knn_k"]}')
+    t = run_reference_trial(model_name, cfg)
+    trials.append(t)
+    image_trials.append(t)
+working = copy.deepcopy(_best_trial(image_trials)['config'])
+
+# Stage C: text-KNN size — test every released value.
+text_trials = []
+for text_k in space['text_knn_k']:
+    cfg = copy.deepcopy(working)
+    cfg['text_knn_k'] = int(text_k)
+    print(f'\n[SMORE Stage C] image_k={cfg["image_knn_k"]}, text_k={text_k}')
+    t = run_reference_trial(model_name, cfg)
+    trials.append(t)
+    text_trials.append(t)
+working = copy.deepcopy(_best_trial(text_trials)['config'])
+
+# Stage D: released regularization values.
+reg_trials = []
+for reg in space['reg_weight']:
+    cfg = copy.deepcopy(working)
+    cfg['reg_weight'] = float(reg)
+    print(f'\n[SMORE Stage D] reg={reg:g}')
+    t = run_reference_trial(model_name, cfg)
+    trials.append(t)
+    reg_trials.append(t)
+working = copy.deepcopy(_best_trial(reg_trials)['config'])
+
+# Stage E: released modality-preference dropout values.
+drop_trials = []
+for drop in space['dropout_rate']:
+    cfg = copy.deepcopy(working)
+    cfg['dropout_rate'] = float(drop)
+    print(f'\n[SMORE Stage E] dropout={drop:g}')
+    t = run_reference_trial(model_name, cfg)
+    trials.append(t)
+    drop_trials.append(t)
+working = copy.deepcopy(_best_trial(drop_trials)['config'])
+
+# Remove duplicate cached configs before final selection.
+unique = {}
+for t in trials:
+    unique[json.dumps(t['config'], sort_keys=True)] = t
+trials = list(unique.values())
+SMORE_TUNING_BEST = _best_trial(trials)
+SMORE_SELECTED_CONFIG = copy.deepcopy(SMORE_TUNING_BEST['config'])
+assert abs(float(SMORE_SELECTED_CONFIG['cl_loss']) - 0.01) < 1e-15
+
+smore_df, smore_tuning_path = save_tuning_table(model_name, trials)
+smore_sel_path = os.path.join(ARTIFACT_DIR, 'selected_smore_config_v3.json')
+with open(smore_sel_path, 'w') as f:
+    json.dump(SMORE_TUNING_BEST, f, indent=2)
+
+print('\nSMORE selected config:')
+print(json.dumps(SMORE_SELECTED_CONFIG, indent=2))
+print(f'Best tuning NDCG@20: {SMORE_TUNING_BEST["best_validation_ndcg20"]:.6f}')
+print('Tuning CSV:', smore_tuning_path)
+print('Selected JSON:', smore_sel_path)
+print('✅ SMORE tuning complete with cl_loss=0.01. No test metric computed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 28
+# ==============================================================================
+# CELL 28 — LOCK CONFIGS + FINAL THREE-SEED REFERENCE-BASELINE TRAINING
+# ==============================================================================
+print('=' * 100)
+print('CELL 28 — LOCK CONFIGS + FINAL THREE-SEED REFERENCE-BASELINE TRAINING')
+print('=' * 100)
+
+
+def _load_selected_config(path):
+    with open(path, 'r') as f:
+        meta = json.load(f)
+    assert meta['implementation_version'] == REFERENCE_IMPLEMENTATION_VERSION
+    assert meta['test_metrics_computed'] is False
+    return copy.deepcopy(meta['config'])
+
+# Load from disk so this cell is restart-safe after completed tuning.
+MMGCN_SELECTED_CONFIG = _load_selected_config(
+    os.path.join(ARTIFACT_DIR, 'selected_mmgcn_ref_config_v3.json')
+)
+BM3_SELECTED_CONFIG = _load_selected_config(
+    os.path.join(ARTIFACT_DIR, 'selected_bm3_ref_config_v3.json')
+)
+SMORE_SELECTED_CONFIG = _load_selected_config(
+    os.path.join(ARTIFACT_DIR, 'selected_smore_config_v3.json')
+)
+assert abs(float(SMORE_SELECTED_CONFIG['cl_loss']) - 0.01) < 1e-15
+
+REFERENCE_SELECTED_CONFIG = {
+    'MMGCN-Ref': MMGCN_SELECTED_CONFIG,
+    'BM3-Ref': BM3_SELECTED_CONFIG,
+    'SMORE': SMORE_SELECTED_CONFIG,
+}
+
+locked_path = os.path.join(ARTIFACT_DIR, 'reference_selected_configs_locked_v3.json')
+with open(locked_path, 'w') as f:
+    json.dump(
+        {
+            'locked_utc': datetime.now(timezone.utc).isoformat(),
+            'implementation_version': REFERENCE_IMPLEMENTATION_VERSION,
+            'tuning_seed': int(TUNING_SEED),
+            'final_seeds': [int(x) for x in SEEDS],
+            'selected_configs': REFERENCE_SELECTED_CONFIG,
+            'selection_metric': 'validation user-NDCG@20',
+            'test_used': False,
+        },
+        f,
+        indent=2,
+    )
+
+print('Locked configs:')
+print(json.dumps(REFERENCE_SELECTED_CONFIG, indent=2))
+print('Lock manifest:', locked_path)
+
+REFERENCE_FINAL_META = {}
+for model_name in ['MMGCN-Ref', 'BM3-Ref', 'SMORE']:
+    print('\n' + '=' * 100)
+    print(f'FINAL THREE-SEED TRAINING — {model_name}')
+    print('=' * 100)
+    runs = []
+    for seed in SEEDS:
+        print(f'\n--- {model_name} | final seed={seed} ---')
+        runs.append(train_reference_final_seed(
+            model_name, REFERENCE_SELECTED_CONFIG[model_name], seed
+        ))
+    REFERENCE_FINAL_META[model_name] = runs
+    print('\nBest validation user-NDCG@20 by seed:')
+    for r in runs:
+        print(
+            f"  seed={r['seed']} | epoch={r['best_epoch']} | "
+            f"NDCG@20={r['best_validation_ndcg20']:.6f}"
+        )
+
+print('\n✅ Final reference baseline training complete.')
+print('✅ Hyperparameters were locked before seeds [42,1,7].')
+print('✅ No test metric was computed.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 29
+# ==============================================================================
+# CELL 29 — FINAL REFERENCE AUDIT + PAPER-STYLE VALIDATION TABLE
+# ==============================================================================
+print('=' * 100)
+print('CELL 29 — FINAL REFERENCE AUDIT + PAPER-STYLE VALIDATION TABLE')
+print('=' * 100)
+
+METRICS_REF = ['HR@10', 'HR@20', 'NDCG@10', 'NDCG@20', 'MRR@20']
+
+
+def _sha256(path, chunk_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            block = f.read(chunk_size)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+rows, manifest = [], []
+for model_name in ['MMGCN-Ref', 'BM3-Ref', 'SMORE']:
+    cfg = REFERENCE_SELECTED_CONFIG[model_name]
+    safe = _safe_name(model_name)
+    for seed in SEEDS:
+        pt_path = os.path.join(REFERENCE_FINAL_DIR, f'best_{safe}_final_seed_{seed}.pt')
+        meta_path = os.path.join(REFERENCE_FINAL_DIR, f'best_{safe}_final_seed_{seed}.json')
+        assert os.path.exists(pt_path), pt_path
+        assert os.path.exists(meta_path), meta_path
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+
+        assert meta['implementation_version'] == REFERENCE_IMPLEMENTATION_VERSION
+        assert meta['stage'] == 'final_three_seed_validation_training'
+        assert meta['model'] == model_name
+        assert int(meta['seed']) == int(seed)
+        assert meta['config'] == _jsonable_cfg(cfg)
+        assert meta['hyperparameters_selected_on_validation'] is True
+        assert int(meta['batch_size']) == int(REFERENCE_BATCH_SIZE)
+        assert int(meta['max_epochs']) == int(REFERENCE_MAX_EPOCHS)
+        assert int(meta['patience']) == int(REFERENCE_PATIENCE)
+        assert int(meta['hyperparameter_tuning_seed']) == TUNING_SEED
+        assert meta['test_used_for_selection'] is False
+        assert meta['test_metrics_computed'] is False
+
+        state = torch.load(pt_path, map_location='cpu', weights_only=True)
+        reference = make_reference_model(model_name, cfg)
+        ref_state = reference.state_dict()
+        assert set(state.keys()) == set(ref_state.keys()), (model_name, seed)
+        for key in state:
+            assert tuple(state[key].shape) == tuple(ref_state[key].shape), (
+                model_name, seed, key, state[key].shape, ref_state[key].shape
+            )
+        del reference, ref_state, state
+        gc.collect()
+
+        m = meta['best_validation_metrics']
+        row = {
+            'model': model_name,
+            'seed': int(seed),
+            'best_epoch': int(meta['best_epoch']),
+            'best_validation_ndcg20': float(meta['best_validation_ndcg20']),
+        }
+        for metric in METRICS_REF:
+            row[metric] = float(m[metric])
+        rows.append(row)
+        manifest.append({
+            'model': model_name,
+            'seed': int(seed),
+            'checkpoint': pt_path,
+            'metadata': meta_path,
+            'sha256': _sha256(pt_path),
+            'best_epoch': int(meta['best_epoch']),
+            'best_validation_ndcg20': float(meta['best_validation_ndcg20']),
+        })
+
+ref_final_per_seed_df = pd.DataFrame(rows)
+summary_rows = []
+for model_name in ['MMGCN-Ref', 'BM3-Ref', 'SMORE']:
+    d = ref_final_per_seed_df[ref_final_per_seed_df['model'] == model_name]
+    assert set(d['seed'].tolist()) == set(SEEDS)
+    row = {'model': model_name, 'seeds': len(d)}
+    for metric in METRICS_REF:
+        vals = d[metric].to_numpy(dtype=float)
+        row[f'{metric}_mean'] = float(vals.mean())
+        row[f'{metric}_sd'] = float(vals.std(ddof=1))
+    summary_rows.append(row)
+ref_final_summary_df = pd.DataFrame(summary_rows).sort_values(
+    'NDCG@20_mean', ascending=False
+).reset_index(drop=True)
+
+per_seed_path = os.path.join(RESULT_DIR, 'reference_baselines_tuned_final_per_seed_v3.csv')
+summary_path = os.path.join(RESULT_DIR, 'reference_baselines_tuned_final_mean_sd_v3.csv')
+manifest_path = os.path.join(ARTIFACT_DIR, 'reference_baselines_tuned_final_manifest_v3.json')
+ref_final_per_seed_df.to_csv(per_seed_path, index=False)
+ref_final_summary_df.to_csv(summary_path, index=False)
+with open(manifest_path, 'w') as f:
+    json.dump(
+        {
+            'implementation_version': REFERENCE_IMPLEMENTATION_VERSION,
+            'selected_configs': REFERENCE_SELECTED_CONFIG,
+            'tuning_seed': int(TUNING_SEED),
+            'final_seeds': [int(x) for x in SEEDS],
+            'checkpoints': manifest,
+            'test_metrics_computed': False,
+        },
+        f,
+        indent=2,
+    )
+
+print('\nFINAL TUNED REFERENCE BASELINES — PER SEED')
+display(ref_final_per_seed_df.sort_values(['model', 'seed']).reset_index(drop=True))
+print('\nFINAL TUNED REFERENCE BASELINES — MEAN ± SD')
+display(ref_final_summary_df)
+
+# ------------------------------------------------------------------------------
+# Merge with the corrected main validation table for a paper-style comparison.
+# Old compact MMGCN/BM3 are deliberately excluded.
+# UVCRec is treated as the backbone-only ablation, not an external baseline.
+# ------------------------------------------------------------------------------
+main_summary_path = os.path.join(RESULT_DIR, 'main_training_validation_mean_sd_v7.csv')
+assert os.path.exists(main_summary_path), main_summary_path
+main_df = pd.read_csv(main_summary_path)
+
+main_keep = main_df[main_df['model'].isin([
+    'Most-Popular', 'LightGCN', 'Text-Only', 'VBPR', 'SAVRec'
+])].copy()
+
+ref_for_main = ref_final_summary_df.copy()
+ref_for_main['model'] = ref_for_main['model'].replace({
+    'MMGCN-Ref': 'MMGCN',
+    'BM3-Ref': 'BM3',
+})
+
+# Align columns shared by the original validation summary.
+common_cols = [c for c in main_keep.columns if c in ref_for_main.columns]
+for c in main_keep.columns:
+    if c not in ref_for_main.columns:
+        ref_for_main[c] = np.nan
+ref_for_main = ref_for_main[main_keep.columns]
+
+paper_validation_df = pd.concat([main_keep, ref_for_main], ignore_index=True)
+paper_validation_df = paper_validation_df.sort_values(
+    'NDCG@20_mean', ascending=False
+).reset_index(drop=True)
+
+paper_path = os.path.join(RESULT_DIR, 'paper_style_validation_main_comparison_v3.csv')
+paper_validation_df.to_csv(paper_path, index=False)
+
+# Backbone-only ablation anchor.
+backbone_df = main_df[main_df['model'].isin(['UVCRec-MG-Attn', 'SAVRec'])].copy()
+backbone_df['model'] = backbone_df['model'].replace({'UVCRec-MG-Attn': 'Backbone-only'})
+backbone_path = os.path.join(RESULT_DIR, 'paper_style_validation_backbone_anchor_v3.csv')
+backbone_df.to_csv(backbone_path, index=False)
+
+print('\nPAPER-STYLE MAIN VALIDATION COMPARISON')
+display(
+    paper_validation_df[[
+        'model',
+        'HR@10_mean', 'HR@10_sd',
+        'NDCG@10_mean', 'NDCG@10_sd',
+        'HR@20_mean', 'HR@20_sd',
+        'NDCG@20_mean', 'NDCG@20_sd',
+        'MRR@20_mean', 'MRR@20_sd',
+    ]]
+)
+
+print('\nBACKBONE-ONLY ABLATION ANCHOR')
+display(
+    backbone_df[[
+        'model',
+        'HR@10_mean', 'HR@10_sd',
+        'NDCG@10_mean', 'NDCG@10_sd',
+        'HR@20_mean', 'HR@20_sd',
+        'NDCG@20_mean', 'NDCG@20_sd',
+        'MRR@20_mean', 'MRR@20_sd',
+    ]]
+)
+
+print('\nSaved:')
+for p in [per_seed_path, summary_path, manifest_path, paper_path, backbone_path]:
+    print('  ', p)
+print('\n✅ All 9 tuned reference-baseline checkpoints passed architecture/metadata audit.')
+print('✅ Old compact MMGCN/BM3 are excluded from the paper-style table.')
+print('✅ SMORE cl_loss=0.01 is enforced in the selected configuration.')
+print('✅ No test metric was computed in Cells 22–29.')
+print('=' * 100)
+
+# %% PUBLIC NOTEBOOK CELL 31
+import os, gc, json, hashlib
+from datetime import datetime, timezone
+import numpy as np, pandas as pd, torch
+import torch.nn.functional as F
+from scipy.stats import spearmanr, wilcoxon
+try:
+    from IPython.display import display
+except Exception:
+    display = print
+
+print('='*100); print('CELL 30 — POST-VALIDATION FREEZE / PREFLIGHT'); print('='*100)
+POSTVAL_VERSION='savrec_v7_post_validation_v3_checkpoint_derived'
+REQ=['train_df','val_df','test_df','selection_val_df','user2idx','item2idx','num_users','num_items',
+     'USER_EVIDENCE','ITEM_EVIDENCE','CANONICAL_IMG_3D','CANONICAL_IMG_MSK','CANONICAL_HOTEL_MEAN',
+     'img_3d','img_msk','hotel_mean','MODEL_CTORS','MODEL_WEIGHT_DECAY','make_savrec','train_bpr_seed',
+     'evaluate_model_v6','evaluate_model_user_metrics','popularity_user_metrics','SEEDS','LR','MAX_EPOCHS',
+     'PATIENCE','SAVREC_BATCH_SIZE','VAL_BATCH_SIZE','CHECKPOINT_DIR','RESULT_DIR','ARTIFACT_DIR','DEVICE',
+     'REFERENCE_SELECTED_CONFIG','REFERENCE_FINAL_DIR','REFERENCE_IMPLEMENTATION_VERSION','make_reference_model','_final_paths','coherence_min','coherence_max']
+missing=[x for x in REQ if x not in globals()]
+if missing: raise RuntimeError('Run V7 Cells 1–29 first. Missing: '+', '.join(missing))
+assert list(SEEDS)==[42,1,7]
+assert USER_EVIDENCE.shape==(num_users,1) and ITEM_EVIDENCE.shape==(num_items,3)
+ANALYSIS_DIR=os.path.join(ARTIFACT_DIR,'post_validation_analysis_v3_checkpoint_derived')
+ABLATION_CHECKPOINT_DIR=os.path.join(CHECKPOINT_DIR,'savrec_ablation_v3_checkpoint_derived')
+FIGURE_DIR=os.path.join(RESULT_DIR,'post_validation_figures_v3_checkpoint_derived')
+for p in [ANALYSIS_DIR,ABLATION_CHECKPOINT_DIR,FIGURE_DIR]: os.makedirs(p,exist_ok=True)
+METRICS_V7=['HR@10','HR@20','NDCG@10','NDCG@20','MRR@20']
+
+# Pre-declare every analysis choice BEFORE running any new validation experiment.
+ABLATION_VARIANTS=['no-history','no-popularity','no-availability','no-coherence']
+DISPLAY_NAME={'no-history':'SAVRec − History','no-popularity':'SAVRec − Popularity',
+              'no-availability':'SAVRec − Availability','no-coherence':'SAVRec − Coherence',
+              'shuffled-evidence':'SAVRec + Shuffled Evidence'}
+SHUFFLE_VARIANT='shuffled-evidence'
+EVIDENCE_ABLATION_STRATEGY='replace the selected evidence channel with its canonical catalog mean; architecture/parameter count unchanged'
+SHUFFLE_USER_SEED_BASE=910000
+SHUFFLE_ITEM_SEED_BASE=920000
+STRESS_SEED=2026
+STRESS_LEVELS=[0.00,0.25,0.50,0.75]
+SIGNIFICANCE_COMPARISONS=[('SAVRec','Backbone-only'),('SAVRec','SMORE')]
+SIGNIFICANCE_METRICS=['NDCG@20','HR@20']
+BOOTSTRAP_RESAMPLES=10000
+BOOTSTRAP_SEED=2026
+
+assert len(selection_val_df)==selection_val_df['user_id'].astype(str).nunique(), 'Expected one validation row per user in current V7 split'
+assert torch.equal(img_msk.bool(),CANONICAL_IMG_MSK.bool()), 'img_msk is not canonical before post-validation analysis'
+assert torch.allclose(img_3d.float(),CANONICAL_IMG_3D.float(),atol=0,rtol=0), 'img_3d is not canonical before post-validation analysis'
+assert torch.allclose(hotel_mean.float(),CANONICAL_HOTEL_MEAN.float(),atol=1e-7,rtol=1e-6), 'hotel_mean is not canonical before post-validation analysis'
+def safe_name_v7(name): return str(name).lower().replace(' ','_').replace('-','_')
+def load_torch_state(path,map_location='cpu'):
+    try: return torch.load(path,map_location=map_location,weights_only=True)
+    except TypeError: return torch.load(path,map_location=map_location)
+def main_checkpoint_paths(name,seed):
+    s=safe_name_v7(name); return os.path.join(CHECKPOINT_DIR,f'best_{s}_seed_{seed}.pt'), os.path.join(CHECKPOINT_DIR,f'best_{s}_seed_{seed}.json')
+def load_main_meta(name,seed):
+    pt,js=main_checkpoint_paths(name,seed); assert os.path.exists(pt) and os.path.exists(js)
+    with open(js) as f: m=json.load(f)
+    assert m['model']==name and int(m['seed'])==int(seed) and m.get('test_used_for_selection') is False
+    assert int(m['selection_validation_users'])==int(selection_val_df['user_id'].astype(str).nunique())
+    return m
+def _frozen_training_fields_from_meta(name):
+    metas=[load_main_meta(name,seed) for seed in SEEDS]
+    def unique_float(field):
+        vals={float(m[field]) for m in metas}
+        if len(vals)!=1:
+            raise RuntimeError(f'{name}: saved checkpoints disagree on {field}: {sorted(vals)}')
+        return next(iter(vals))
+    def unique_int(field):
+        vals={int(m[field]) for m in metas}
+        if len(vals)!=1:
+            raise RuntimeError(f'{name}: saved checkpoints disagree on {field}: {sorted(vals)}')
+        return next(iter(vals))
+    return {
+        'lr': unique_float('lr'),
+        'weight_decay': unique_float('weight_decay'),
+        'batch_size': unique_int('batch_size'),
+    }
+
+SAVREC_FROZEN_TRAINING=_frozen_training_fields_from_meta('SAVRec')
+BACKBONE_FROZEN_TRAINING=_frozen_training_fields_from_meta('UVCRec-MG-Attn')
+SAVREC_FROZEN_LR=float(SAVREC_FROZEN_TRAINING['lr'])
+SAVREC_FROZEN_WEIGHT_DECAY=float(SAVREC_FROZEN_TRAINING['weight_decay'])
+SAVREC_FROZEN_BATCH_SIZE=int(SAVREC_FROZEN_TRAINING['batch_size'])
+BACKBONE_FROZEN_WEIGHT_DECAY=float(BACKBONE_FROZEN_TRAINING['weight_decay'])
+
+print('Frozen SAVRec training metadata :', SAVREC_FROZEN_TRAINING)
+print('Frozen Backbone training metadata:', BACKBONE_FROZEN_TRAINING)
+print('Current MODEL_WEIGHT_DECAY[SAVRec]:', MODEL_WEIGHT_DECAY.get('SAVRec'))
+print('Current MODEL_WEIGHT_DECAY[UVCRec-MG-Attn]:', MODEL_WEIGHT_DECAY.get('UVCRec-MG-Attn'))
+
+# train_bpr_seed reads LR from the global namespace, so it must match the frozen SAVRec run.
+if abs(float(LR)-SAVREC_FROZEN_LR)>=1e-15:
+    raise RuntimeError(
+        f'Global LR={LR} does not match saved SAVRec checkpoint LR={SAVREC_FROZEN_LR}. '
+        'Do not run ablations until the original SAVRec training protocol is restored.'
+    )
+if int(SAVREC_BATCH_SIZE)!=SAVREC_FROZEN_BATCH_SIZE:
+    raise RuntimeError(
+        f'SAVREC_BATCH_SIZE={SAVREC_BATCH_SIZE} does not match saved SAVRec checkpoint batch_size='
+        f'{SAVREC_FROZEN_BATCH_SIZE}.'
+    )
+
+# The central mechanism claim uses UVCRec as a matched backbone. Optimizer regularization
+# must therefore match, otherwise the attribution to evidence regulation is confounded.
+if abs(SAVREC_FROZEN_WEIGHT_DECAY-BACKBONE_FROZEN_WEIGHT_DECAY)>=1e-15:
+    raise RuntimeError(
+        'MATCHED-BACKBONE FAIRNESS CHECK FAILED. '
+        f'Saved SAVRec weight_decay={SAVREC_FROZEN_WEIGHT_DECAY:g}, while saved UVCRec-MG-Attn '
+        f'weight_decay={BACKBONE_FROZEN_WEIGHT_DECAY:g}. '
+        'Do NOT launch Cells 31-38 yet. The main SAVRec/backbone comparison is not optimizer-matched. '
+        'Rerun one side under the same frozen weight decay before evidence ablations.'
+    )
+
+# The current dictionary may differ from historical metadata after notebook edits.
+# From this point onward, ablations use checkpoint-derived SAVRec settings, never the dictionary value.
+if abs(float(MODEL_WEIGHT_DECAY.get('SAVRec', float('nan')))-SAVREC_FROZEN_WEIGHT_DECAY)>=1e-15:
+    print('⚠️ Current MODEL_WEIGHT_DECAY[SAVRec] differs from saved checkpoint metadata; '
+          'ablations will use the checkpoint-derived frozen value.')
+
+def load_main_model(name,seed):
+    pt,_=main_checkpoint_paths(name,seed); model=MODEL_CTORS[name]().to(DEVICE)
+    model.load_state_dict(load_torch_state(pt,DEVICE),strict=True); model.eval(); return model
+
+for name in ['LightGCN','Text-Only','VBPR','UVCRec-MG-Attn','SAVRec']:
+    for seed in SEEDS: load_main_meta(name,seed)
+for name in ['MMGCN-Ref','BM3-Ref','SMORE']:
+    for seed in SEEDS:
+        pt,js=_final_paths(name,seed); assert os.path.exists(pt) and os.path.exists(js)
+        with open(js) as f: m=json.load(f)
+        assert m.get('implementation_version')==REFERENCE_IMPLEMENTATION_VERSION
+        assert m.get('stage')=='final_three_seed_validation_training' and m.get('model')==name and int(m.get('seed'))==int(seed)
+        assert m['config']==REFERENCE_SELECTED_CONFIG[name] and m.get('test_metrics_computed') is False and m.get('test_used_for_selection') is False
+
+FREEZE30_PATH=os.path.join(ANALYSIS_DIR,'cell30_post_validation_freeze.json')
+with open(FREEZE30_PATH,'w') as f:
+    json.dump({'created_utc':datetime.now(timezone.utc).isoformat(),'version':POSTVAL_VERSION,'seeds':SEEDS,
+               'selection_metric':'validation user-NDCG@20','reference_selected_configs':REFERENCE_SELECTED_CONFIG,
+               'savrec_frozen_training':SAVREC_FROZEN_TRAINING,'backbone_frozen_training':BACKBONE_FROZEN_TRAINING,
+               'planned_ablation_variants':ABLATION_VARIANTS+[SHUFFLE_VARIANT],
+               'evidence_ablation_strategy':EVIDENCE_ABLATION_STRATEGY,
+               'shuffle_seed_bases':{'user':SHUFFLE_USER_SEED_BASE,'item':SHUFFLE_ITEM_SEED_BASE},
+               'visual_stress_seed':STRESS_SEED,'visual_stress_removal_fractions':STRESS_LEVELS,
+               'visual_stress_design':'fixed nested per-hotel image subsets; higher removal is a subset of lower removal',
+               'planned_significance_comparisons':[f'{a} vs {b}' for a,b in SIGNIFICANCE_COMPARISONS],
+               'planned_significance_metrics':SIGNIFICANCE_METRICS,'bootstrap_resamples':BOOTSTRAP_RESAMPLES,
+               'current_pipeline_test_used_for_selection':False,'historical_test_previously_inspected_in_prior_development':True},f,indent=2)
+print('✅ Preflight passed. No test metric computed.')
+
+
+# %% PUBLIC NOTEBOOK CELL 32
+print('='*100); print('CELL 31 — SAVREC EVIDENCE ABLATIONS'); print('='*100)
+
+def make_evidence_variant(v):
+    u=USER_EVIDENCE.detach().clone(); i=ITEM_EVIDENCE.detach().clone()
+    if v=='no-history': u[:,0]=USER_EVIDENCE[:,0].mean()
+    elif v=='no-popularity': i[:,0]=ITEM_EVIDENCE[:,0].mean()
+    elif v=='no-availability': i[:,1]=ITEM_EVIDENCE[:,1].mean()
+    elif v=='no-coherence': i[:,2]=ITEM_EVIDENCE[:,2].mean()
+    elif v!='full': raise KeyError(v)
+    return u,i
+
+def evidence_signature(u_ev,i_ev):
+    h=hashlib.sha256()
+    for t in (u_ev,i_ev):
+        a=t.detach().float().cpu().contiguous().numpy()
+        h.update(str(a.shape).encode()); h.update(a.tobytes())
+    return h.hexdigest()
+
+def ablation_model_name(v): return f'SAVRec-{v}'
+def ablation_paths(v,seed):
+    s=safe_name_v7(ablation_model_name(v)); return os.path.join(ABLATION_CHECKPOINT_DIR,f'best_{s}_seed_{seed}.pt'), os.path.join(ABLATION_CHECKPOINT_DIR,f'best_{s}_seed_{seed}.json')
+def load_cached_ablation_meta(v,seed,expected_evidence_signature):
+    pt,js=ablation_paths(v,seed)
+    if not(os.path.exists(pt) and os.path.exists(js)): return None
+    with open(js) as f: m=json.load(f)
+    ok=(m.get('postval_version')==POSTVAL_VERSION and m.get('variant')==v and int(m.get('seed',-1))==int(seed)
+        and m.get('test_metrics_computed') is False and m.get('test_used_for_selection') is False
+        and m.get('evidence_signature')==expected_evidence_signature
+        and abs(float(m.get('lr',-1))-float(LR))<1e-15
+        and abs(float(m.get('weight_decay',-1))-SAVREC_FROZEN_WEIGHT_DECAY)<1e-15
+        and int(m.get('batch_size',-1))==int(SAVREC_BATCH_SIZE))
+    return m if ok else None
+
+def train_ablation_seed(v,seed,u_ev=None,i_ev=None):
+    if u_ev is None or i_ev is None: u_ev,i_ev=make_evidence_variant(v)
+    ev_sig=evidence_signature(u_ev,i_ev)
+    c=load_cached_ablation_meta(v,seed,ev_sig)
+    if c:
+        print(f"[cached] {v} seed={seed} ep={c['best_epoch']} NDCG@20={c['best_validation_ndcg20']:.6f}"); return c
+    ctor=lambda u=u_ev,i=i_ev: make_savrec(user_evidence=u,item_evidence=i)
+    m=train_bpr_seed(model_name=ablation_model_name(v),ctor=ctor,seed=seed,
+                     weight_decay=SAVREC_FROZEN_WEIGHT_DECAY,batch_size=SAVREC_FROZEN_BATCH_SIZE,
+                     max_epochs=MAX_EPOCHS,patience=PATIENCE,checkpoint_dir=ABLATION_CHECKPOINT_DIR)
+    m.update({'postval_version':POSTVAL_VERSION,'analysis_stage':'savrec_evidence_ablation','variant':v,
+              'test_metrics_computed':False,'test_used_for_selection':False,'evidence_signature':ev_sig,
+              'ablation_strategy':EVIDENCE_ABLATION_STRATEGY})
+    _,js=ablation_paths(v,seed)
+    with open(js,'w') as f: json.dump(m,f,indent=2)
+    return m
+
+ABLATION_META={}
+for v in ABLATION_VARIANTS:
+    runs=[]
+    for seed in SEEDS: runs.append(train_ablation_seed(v,seed))
+    ABLATION_META[v]=runs
+print('✅ Cell 31 complete. No test metric computed.')
+
+
+# %% PUBLIC NOTEBOOK CELL 33
+print('='*100); print('CELL 32 — SHUFFLED-EVIDENCE CONTROL'); print('='*100)
+def make_shuffled_evidence(seed):
+    gu=torch.Generator(device='cpu').manual_seed(SHUFFLE_USER_SEED_BASE+int(seed)); gi=torch.Generator(device='cpu').manual_seed(SHUFFLE_ITEM_SEED_BASE+int(seed))
+    up=torch.randperm(num_users,generator=gu).to(USER_EVIDENCE.device); ip=torch.randperm(num_items,generator=gi).to(ITEM_EVIDENCE.device)
+    return USER_EVIDENCE.detach().clone()[up], ITEM_EVIDENCE.detach().clone()[ip]
+SHUFFLED_META=[]
+for seed in SEEDS:
+    u,i=make_shuffled_evidence(seed); SHUFFLED_META.append(train_ablation_seed(SHUFFLE_VARIANT,seed,u,i))
+
+rows=[]
+for name,label in [('UVCRec-MG-Attn','Backbone-only'),('SAVRec','Full SAVRec')]:
+    for seed in SEEDS:
+        m=load_main_meta(name,seed); r={'variant':label,'seed':seed,'best_epoch':m['best_epoch']}; r.update({x:m['best_validation_metrics'][x] for x in METRICS_V7}); rows.append(r)
+for v,runs in ABLATION_META.items():
+    for m in runs:
+        r={'variant':DISPLAY_NAME[v],'seed':m['seed'],'best_epoch':m['best_epoch']}; r.update({x:m['best_validation_metrics'][x] for x in METRICS_V7}); rows.append(r)
+for m in SHUFFLED_META:
+    r={'variant':DISPLAY_NAME[SHUFFLE_VARIANT],'seed':m['seed'],'best_epoch':m['best_epoch']}; r.update({x:m['best_validation_metrics'][x] for x in METRICS_V7}); rows.append(r)
+ablation_val_per_seed_df=pd.DataFrame(rows)
+s=[]
+for v,d in ablation_val_per_seed_df.groupby('variant',sort=False):
+    r={'variant':v,'seeds':d.seed.nunique()}
+    for x in METRICS_V7:
+        a=d[x].to_numpy(float); r[x+'_mean']=a.mean(); r[x+'_sd']=a.std(ddof=1) if len(a)>1 else 0
+    s.append(r)
+ablation_val_summary_df=pd.DataFrame(s).sort_values('NDCG@20_mean',ascending=False).reset_index(drop=True)
+ABLATION_VAL_PER_SEED_PATH=os.path.join(RESULT_DIR,'savrec_ablation_validation_per_seed_v3.csv')
+ABLATION_VAL_SUMMARY_PATH=os.path.join(RESULT_DIR,'savrec_ablation_validation_mean_sd_v3.csv')
+ablation_val_per_seed_df.to_csv(ABLATION_VAL_PER_SEED_PATH,index=False); ablation_val_summary_df.to_csv(ABLATION_VAL_SUMMARY_PATH,index=False)
+display(ablation_val_summary_df); print('✅ Cell 32 complete. No test metric computed.')
+
+
+# %% PUBLIC NOTEBOOK CELL 34
+print('='*100); print('CELL 33 — SAVREC EVIDENCE-GATE ANALYSIS'); print('='*100)
+GATE_BATCH_SIZE=512
+
+def collect_savrec_gate_pairs(model,eval_df,seed,batch_size=GATE_BATCH_SIZE):
+    model.eval(); us=eval_df['user_id'].astype(str).tolist(); it=eval_df['img_hotel_id'].astype(str).tolist()
+    ui=np.asarray([user2idx[x] for x in us],dtype=np.int64); ii=np.asarray([item2idx[x] for x in it],dtype=np.int64); rec=[]
+    with torch.no_grad():
+        for st in range(0,len(eval_df),batch_size):
+            en=min(st+batch_size,len(eval_df)); u=torch.as_tensor(ui[st:en],dtype=torch.long,device=DEVICE); q=torch.as_tensor(ii[st:en],dtype=torch.long,device=DEVICE).unsqueeze(1)
+            _,_,eg,og,_,_=model.pair_representation(u,q,return_evidence_gate=True)
+            eg=eg[:,0].float().cpu().numpy(); og=og[:,0,:].mean(-1).float().cpu().numpy()
+            ue=model.user_evidence[u][:,0].float().cpu().numpy(); ie=model.item_evidence[q[:,0]].float().cpu().numpy()
+            for j in range(en-st):
+                rec.append({'seed':int(seed),'user_id':us[st+j],'img_hotel_id':it[st+j],'history':float(ue[j]),
+                            'popularity':float(ie[j,0]),'availability':float(ie[j,1]),'coherence':float(ie[j,2]),
+                            'evidence_gate':float(eg[j]),'original_gate_mean':float(og[j])})
+    return pd.DataFrame(rec)
+
+g=[]
+for seed in SEEDS:
+    print('Gate extraction seed',seed); m=load_main_model('SAVRec',seed); g.append(collect_savrec_gate_pairs(m,selection_val_df,seed)); del m; gc.collect(); torch.cuda.empty_cache()
+gate_val_df=pd.concat(g,ignore_index=True)
+GATE_VAL_PATH=os.path.join(RESULT_DIR,'savrec_validation_gate_per_pair_v3.csv'); gate_val_df.to_csv(GATE_VAL_PATH,index=False)
+cr=[]
+for seed,d in gate_val_df.groupby('seed'):
+    for feat in ['history','popularity','availability','coherence']:
+        x=d[feat].to_numpy(float); y=d.evidence_gate.to_numpy(float)
+        rho,p=(np.nan,np.nan) if np.std(x)<1e-12 or np.std(y)<1e-12 else spearmanr(x,y)
+        cr.append({'seed':seed,'feature':feat,'spearman_rho':rho,'p_value_descriptive':p})
+gate_corr_df=pd.DataFrame(cr); GATE_CORR_PATH=os.path.join(RESULT_DIR,'savrec_validation_gate_spearman_v3.csv'); gate_corr_df.to_csv(GATE_CORR_PATH,index=False)
+br=[]
+for seed,d0 in gate_val_df.groupby('seed'):
+    for feat in ['history','popularity','availability','coherence']:
+        d=d0[[feat,'evidence_gate']].copy()
+        try: d['bin']=pd.qcut(d[feat],4,duplicates='drop')
+        except Exception: continue
+        for b,z in d.groupby('bin',observed=True): br.append({'seed':seed,'feature':feat,'bin':str(b),'n':len(z),'feature_mean':z[feat].mean(),'gate_mean':z.evidence_gate.mean(),'gate_sd':z.evidence_gate.std(ddof=1) if len(z)>1 else 0})
+gate_bins_df=pd.DataFrame(br); GATE_BINS_PATH=os.path.join(RESULT_DIR,'savrec_validation_gate_quantiles_v2.csv'); gate_bins_df.to_csv(GATE_BINS_PATH,index=False)
+gate_clean_mean_by_seed=gate_val_df.groupby('seed').evidence_gate.mean().to_dict()
+display(gate_corr_df); print('✅ Cell 33 complete. Validation only.')
+
+
+# %% PUBLIC NOTEBOOK CELL 35
+print('='*100); print('CELL 34 — VISUAL AVAILABILITY STRESS TEST'); print('='*100)
+
+def recompute_coherence(images,mask):
+    x=F.normalize(images.detach().float().cpu(),p=2,dim=-1); mk=mask.detach().bool().cpu(); raw=np.zeros(num_items,np.float32)
+    for iid in range(num_items):
+        idx=mk[iid]; n=int(idx.sum())
+        if n<2: continue
+        q=x[iid][idx]; sim=q@q.T; tri=torch.triu_indices(n,n,offset=1); raw[iid]=float(sim[tri[0],tri[1]].mean())
+    raw=np.nan_to_num(raw,nan=0,posinf=1,neginf=0); rng=float(coherence_max)-float(coherence_min)
+    feat=np.zeros_like(raw) if rng<=1e-12 else (raw-float(coherence_min))/rng
+    return np.clip(feat,0,1).astype(np.float32)
+
+def make_nested_corrupted_mask(frac,seed=STRESS_SEED):
+    # IMPORTANT: the same deterministic per-hotel image ordering is used at every
+    # corruption level. Therefore the 75%-removal set is a subset of the 50% set,
+    # which is a subset of the 25% set. This makes the degradation curve causal and
+    # interpretable instead of comparing unrelated random masks.
+    frac=float(frac); bm=CANONICAL_IMG_MSK.detach().bool().cpu(); nm=torch.zeros_like(bm)
+    gen=torch.Generator(device='cpu').manual_seed(int(seed))
+    for iid in range(num_items):
+        idx=torch.where(bm[iid])[0]; n=int(idx.numel()); assert n>0
+        order=idx[torch.randperm(n,generator=gen)]
+        keep=max(1,min(n,int(round(n*(1.0-frac)))))
+        nm[iid,order[:keep]]=True
+    return nm.to(CANONICAL_IMG_MSK.device)
+
+STRESS_MASKS={float(frac):make_nested_corrupted_mask(frac) for frac in STRESS_LEVELS}
+_sorted_levels=sorted(float(x) for x in STRESS_LEVELS)
+assert torch.equal(STRESS_MASKS[0.0].bool(),CANONICAL_IMG_MSK.bool())
+for low,high in zip(_sorted_levels[:-1],_sorted_levels[1:]):
+    # Every image retained at a higher-removal level must also have been retained
+    # at the preceding lower-removal level.
+    assert not torch.any(STRESS_MASKS[high] & ~STRESS_MASKS[low]), (low,high)
+
+def make_corrupted_visual_state(frac,seed=STRESS_SEED):
+    frac=float(frac); base=CANONICAL_IMG_3D.detach().clone(); nm=STRESS_MASKS[frac].detach().clone()
+    ni=base.clone(); ni[~nm]=0
+    cnt=nm.sum(1,keepdim=True).clamp(min=1); hm=F.normalize((ni*nm.unsqueeze(-1).float()).sum(1)/cnt,p=2,dim=-1)
+    if frac==0.0:
+        assert torch.allclose(hm.float(),CANONICAL_HOTEL_MEAN.float(),atol=1e-6,rtol=1e-5)
+    av=nm.sum(1).float()/float(CANONICAL_IMG_MSK.shape[1]); coh=torch.tensor(recompute_coherence(ni,nm),device=ITEM_EVIDENCE.device)
+    iev=ITEM_EVIDENCE.detach().clone(); iev[:,1]=av.to(iev.device); iev[:,2]=coh
+    return {'img_3d':ni,'img_msk':nm,'hotel_mean':hm,'item_evidence':iev,'mean_images':float(nm.sum(1).float().mean())}
+
+def mean_gate_for_eval(model,df): return float(collect_savrec_gate_pairs(model,df,-1).evidence_gate.mean())
+
+def run_visual_stress_split(df,split_name,levels=STRESS_LEVELS,reuse_validation_clean=False):
+    global img_3d,img_msk,hotel_mean
+    oi,om,oh=img_3d,img_msk,hotel_mean; out=[]
+    try:
+        for frac in levels:
+            st=make_corrupted_visual_state(frac); img_3d,img_msk,hotel_mean=st['img_3d'],st['img_msk'],st['hotel_mean']
+            print(f'\n{split_name} visual removal={frac:.0%}, mean images={st["mean_images"]:.2f}')
+            for name in ['UVCRec-MG-Attn','SAVRec']:
+                for seed in SEEDS:
+                    if split_name=='validation' and reuse_validation_clean and frac==0:
+                        mt=load_main_meta(name,seed); met={x:mt['best_validation_metrics'][x] for x in METRICS_V7}; gm=gate_clean_mean_by_seed[seed] if name=='SAVRec' else np.nan
+                    else:
+                        m=load_main_model(name,seed)
+                        if name=='SAVRec':
+                            with torch.no_grad(): m.item_evidence.copy_(st['item_evidence'].to(m.item_evidence.device))
+                        met=evaluate_model_v6(m,df,batch_size=VAL_BATCH_SIZE); gm=mean_gate_for_eval(m,df) if name=='SAVRec' else np.nan
+                        del m; gc.collect(); torch.cuda.empty_cache()
+                    r={'split':split_name,'model':'Backbone-only' if name=='UVCRec-MG-Attn' else 'SAVRec','seed':seed,'removal_fraction':frac,'mean_images_remaining':st['mean_images'],'mean_evidence_gate':gm}; r.update(met); out.append(r)
+    finally:
+        img_3d,img_msk,hotel_mean=oi,om,oh
+        assert torch.equal(img_msk.bool(),CANONICAL_IMG_MSK.bool())
+        assert torch.allclose(img_3d.float(),CANONICAL_IMG_3D.float(),atol=0,rtol=0)
+        assert torch.allclose(hotel_mean.float(),CANONICAL_HOTEL_MEAN.float(),atol=1e-7,rtol=1e-6)
+    return pd.DataFrame(out)
+
+def summarize_stress(df):
+    rr=[]
+    for (m,f),d in df.groupby(['model','removal_fraction'],sort=False):
+        r={'model':m,'removal_fraction':f,'seeds':d.seed.nunique(),'mean_images_remaining':d.mean_images_remaining.mean()}
+        for x in METRICS_V7:
+            a=d[x].to_numpy(float); r[x+'_mean']=a.mean(); r[x+'_sd']=a.std(ddof=1)
+        if m=='SAVRec': r['evidence_gate_mean']=d.mean_evidence_gate.mean(); r['evidence_gate_sd']=d.mean_evidence_gate.std(ddof=1)
+        rr.append(r)
+    z=pd.DataFrame(rr); z['NDCG@20_relative_drop']=np.nan
+    for m,d in z.groupby('model'):
+        clean=d.loc[d.removal_fraction==0,'NDCG@20_mean']
+        if len(clean)==1 and clean.iloc[0]!=0:
+            idx=z.model==m; z.loc[idx,'NDCG@20_relative_drop']=(float(clean.iloc[0])-z.loc[idx,'NDCG@20_mean'])/float(clean.iloc[0])
+    return z
+
+stress_val_per_seed_df=run_visual_stress_split(selection_val_df,'validation',reuse_validation_clean=True)
+stress_val_summary_df=summarize_stress(stress_val_per_seed_df)
+STRESS_VAL_PER_SEED_PATH=os.path.join(RESULT_DIR,'visual_stress_validation_per_seed_v3.csv'); STRESS_VAL_SUMMARY_PATH=os.path.join(RESULT_DIR,'visual_stress_validation_mean_sd_v3.csv')
+stress_val_per_seed_df.to_csv(STRESS_VAL_PER_SEED_PATH,index=False); stress_val_summary_df.to_csv(STRESS_VAL_SUMMARY_PATH,index=False)
+display(stress_val_summary_df.sort_values(['removal_fraction','model'])); print('✅ Cell 34 complete. No test metric computed.')
+
+
+# %% PUBLIC NOTEBOOK CELL 36
+# ==============================================================================
+# CELL 34B — MULTI-SEED VISUAL AVAILABILITY STRESS TEST
+# ==============================================================================
+# Purpose:
+#   Repeat the VALIDATION-only visual-availability stress test over multiple
+#   deterministic corruption seeds. Frozen model checkpoints are NEVER retrained.
+#
+# Design:
+#   - Model seeds:      [42, 1, 7]  (already frozen)
+#   - Corruption seeds: [2026, 2027, 2028, 2029, 2030]
+#   - Removal levels:   0%, 25%, 50%, 75%
+#   - Within each corruption seed, masks are NESTED across removal levels.
+#   - Clean 0% rows are reused from Cell 34 (corruption seed is irrelevant).
+#   - Every corrupted evaluation is cached individually to Drive.
+#   - NO TEST METRIC is computed here.
+#
+# Statistical summary:
+#   1) Average across corruption seeds WITHIN each frozen model seed.
+#   2) Report mean ± SD across the 3 frozen model seeds.
+#   This avoids treating 15 model/corruption combinations as 15 independent
+#   model-training replicates.
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 34B — MULTI-SEED VISUAL AVAILABILITY STRESS TEST')
+print('=' * 100)
+
+MULTI_STRESS_SEEDS = [2026, 2027, 2028, 2029, 2030]
+MULTI_STRESS_LEVELS = [0.00, 0.25, 0.50, 0.75]
+MULTI_STRESS_VERSION = 'savrec_v7_visual_stress_multiseed_v1'
+
+# ------------------------------------------------------------------------------
+# 0. Required state / safety checks
+# ------------------------------------------------------------------------------
+_required_34b = [
+    'selection_val_df', 'CANONICAL_IMG_3D', 'CANONICAL_IMG_MSK',
+    'CANONICAL_HOTEL_MEAN', 'ITEM_EVIDENCE', 'coherence_min', 'coherence_max',
+    'make_nested_corrupted_mask', 'recompute_coherence',
+    'load_main_model', 'load_main_meta', 'evaluate_model_v6',
+    'mean_gate_for_eval', 'gate_clean_mean_by_seed',
+    'METRICS_V7', 'SEEDS', 'RESULT_DIR', 'ARTIFACT_DIR',
+    'img_3d', 'img_msk', 'hotel_mean'
+]
+_missing_34b = [x for x in _required_34b if x not in globals()]
+if _missing_34b:
+    raise RuntimeError(
+        'Cell 34B requires Cell 30–34 state. Missing: ' + ', '.join(_missing_34b)
+    )
+
+assert SEEDS == [42, 1, 7]
+assert MULTI_STRESS_SEEDS == [2026, 2027, 2028, 2029, 2030]
+assert MULTI_STRESS_LEVELS == [0.00, 0.25, 0.50, 0.75]
+assert len(selection_val_df) == 9045
+assert selection_val_df['user_id'].astype(str).nunique() == 9045
+
+# Cell 34 must have restored the canonical global visual state.
+assert torch.equal(img_msk.bool(), CANONICAL_IMG_MSK.bool())
+assert torch.allclose(img_3d.float(), CANONICAL_IMG_3D.float(), atol=0, rtol=0)
+assert torch.allclose(
+    hotel_mean.float(), CANONICAL_HOTEL_MEAN.float(), atol=1e-7, rtol=1e-6
+)
+
+MULTI_STRESS_CACHE_DIR = os.path.join(
+    ARTIFACT_DIR, 'visual_stress_multiseed_v1_cache'
+)
+os.makedirs(MULTI_STRESS_CACHE_DIR, exist_ok=True)
+
+MULTI_STRESS_PER_RUN_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_validation_multiseed_per_run_v1.csv'
+)
+MULTI_STRESS_MODELSEED_AVG_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_validation_multiseed_modelseed_avg_v1.csv'
+)
+MULTI_STRESS_SUMMARY_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_validation_multiseed_summary_v1.csv'
+)
+MULTI_STRESS_CORRUPTION_SUMMARY_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_validation_multiseed_corruption_summary_v1.csv'
+)
+MULTI_STRESS_MANIFEST_PATH = os.path.join(
+    ARTIFACT_DIR, 'visual_stress_validation_multiseed_manifest_v1.json'
+)
+
+
+def _stress34b_safe_model_name(name):
+    return name.lower().replace(' ', '_').replace('-', '_')
+
+
+def _stress34b_cache_path(model_name, model_seed, corruption_seed, frac):
+    safe = _stress34b_safe_model_name(model_name)
+    pct = int(round(float(frac) * 100))
+    return os.path.join(
+        MULTI_STRESS_CACHE_DIR,
+        f'{safe}_modelseed_{int(model_seed)}_corrseed_{int(corruption_seed)}_remove_{pct}.json'
+    )
+
+
+def _stress34b_expected_signature(model_name, model_seed, corruption_seed, frac):
+    return {
+        'version': MULTI_STRESS_VERSION,
+        'split': 'validation',
+        'model': model_name,
+        'model_seed': int(model_seed),
+        'corruption_seed': int(corruption_seed),
+        'removal_fraction': float(frac),
+        'validation_users': int(selection_val_df['user_id'].astype(str).nunique()),
+        'validation_interactions': int(len(selection_val_df)),
+        'test_metrics_computed': False,
+    }
+
+
+def _stress34b_load_cache(model_name, model_seed, corruption_seed, frac):
+    path = _stress34b_cache_path(model_name, model_seed, corruption_seed, frac)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            row = json.load(f)
+    except Exception:
+        return None
+
+    expected = _stress34b_expected_signature(
+        model_name, model_seed, corruption_seed, frac
+    )
+    for k, v in expected.items():
+        if row.get(k) != v:
+            return None
+
+    for metric in METRICS_V7:
+        if metric not in row or not np.isfinite(float(row[metric])):
+            return None
+
+    if model_name == 'SAVRec':
+        if not np.isfinite(float(row.get('mean_evidence_gate', np.nan))):
+            return None
+
+    return row
+
+
+def _stress34b_save_cache(row):
+    path = _stress34b_cache_path(
+        row['model'], row['model_seed'], row['corruption_seed'],
+        row['removal_fraction']
+    )
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(row, f, indent=2, allow_nan=False)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------------
+# 1. Seed-specific nested corruption masks
+# ------------------------------------------------------------------------------
+def make_multiseed_corrupted_visual_state(frac, corruption_seed):
+    """Construct one deterministic corrupted visual state for one corruption seed."""
+    frac = float(frac)
+    corruption_seed = int(corruption_seed)
+
+    new_mask = make_nested_corrupted_mask(frac, seed=corruption_seed)
+    new_images = CANONICAL_IMG_3D.detach().clone()
+    new_images[~new_mask] = 0
+
+    counts = new_mask.sum(1, keepdim=True).clamp(min=1)
+    new_hotel_mean = F.normalize(
+        (new_images * new_mask.unsqueeze(-1).float()).sum(1) / counts,
+        p=2,
+        dim=-1,
+    )
+
+    if frac == 0.0:
+        assert torch.equal(new_mask.bool(), CANONICAL_IMG_MSK.bool())
+        assert torch.allclose(
+            new_hotel_mean.float(),
+            CANONICAL_HOTEL_MEAN.float(),
+            atol=1e-6,
+            rtol=1e-5,
+        )
+
+    availability = (
+        new_mask.sum(1).float() / float(CANONICAL_IMG_MSK.shape[1])
+    )
+    coherence = torch.tensor(
+        recompute_coherence(new_images, new_mask),
+        dtype=ITEM_EVIDENCE.dtype,
+        device=ITEM_EVIDENCE.device,
+    )
+
+    new_item_evidence = ITEM_EVIDENCE.detach().clone()
+    new_item_evidence[:, 1] = availability.to(new_item_evidence.device)
+    new_item_evidence[:, 2] = coherence
+
+    return {
+        'img_3d': new_images,
+        'img_msk': new_mask,
+        'hotel_mean': new_hotel_mean,
+        'item_evidence': new_item_evidence,
+        'mean_images': float(new_mask.sum(1).float().mean().item()),
+    }
+
+
+# Verify nestedness independently for every corruption seed BEFORE evaluation.
+for corr_seed in MULTI_STRESS_SEEDS:
+    masks = {
+        float(frac): make_nested_corrupted_mask(frac, seed=corr_seed)
+        for frac in MULTI_STRESS_LEVELS
+    }
+    assert torch.equal(masks[0.0].bool(), CANONICAL_IMG_MSK.bool())
+    levels = sorted(masks)
+    for low, high in zip(levels[:-1], levels[1:]):
+        assert not torch.any(masks[high] & ~masks[low]), (
+            corr_seed, low, high
+        )
+
+print('✅ Nested-mask audit passed for all 5 corruption seeds.')
+
+
+# ------------------------------------------------------------------------------
+# 2. Reuse clean Cell-34 rows; corruption seed is irrelevant at 0%.
+# ------------------------------------------------------------------------------
+if 'stress_val_per_seed_df' in globals():
+    _clean_source = stress_val_per_seed_df.copy()
+elif 'STRESS_VAL_PER_SEED_PATH' in globals() and os.path.exists(STRESS_VAL_PER_SEED_PATH):
+    _clean_source = pd.read_csv(STRESS_VAL_PER_SEED_PATH)
+else:
+    raise RuntimeError(
+        'Cell 34 clean validation stress results are unavailable. Run Cell 34 first.'
+    )
+
+_clean_source = _clean_source[
+    np.isclose(_clean_source['removal_fraction'].astype(float), 0.0)
+].copy()
+assert len(_clean_source) == 2 * len(SEEDS), len(_clean_source)
+
+rows_34b = []
+for _, r0 in _clean_source.iterrows():
+    model_name = str(r0['model'])
+    model_seed = int(r0['seed'])
+    row = _stress34b_expected_signature(
+        model_name, model_seed, -1, 0.0
+    )
+    row.update({
+        'mean_images_remaining': float(r0['mean_images_remaining']),
+        'mean_evidence_gate': (
+            None if model_name != 'SAVRec'
+            else float(r0['mean_evidence_gate'])
+        ),
+    })
+    for metric in METRICS_V7:
+        row[metric] = float(r0[metric])
+    rows_34b.append(row)
+
+
+# ------------------------------------------------------------------------------
+# 3. Evaluate 25/50/75% removal over FIVE corruption seeds
+# ------------------------------------------------------------------------------
+global_img_3d_before = img_3d
+global_img_msk_before = img_msk
+global_hotel_mean_before = hotel_mean
+
+try:
+    for corr_seed in MULTI_STRESS_SEEDS:
+        print('\n' + '-' * 100)
+        print(f'CORRUPTION SEED {corr_seed}')
+        print('-' * 100)
+
+        for frac in MULTI_STRESS_LEVELS[1:]:
+            state = make_multiseed_corrupted_visual_state(frac, corr_seed)
+
+            # The model definitions read these global visual tensors at scoring time.
+            img_3d = state['img_3d']
+            img_msk = state['img_msk']
+            hotel_mean = state['hotel_mean']
+
+            print(
+                f'removal={frac:.0%} | '
+                f'mean images remaining={state["mean_images"]:.3f}'
+            )
+
+            for internal_name, report_name in [
+                ('UVCRec-MG-Attn', 'Backbone-only'),
+                ('SAVRec', 'SAVRec'),
+            ]:
+                for model_seed in SEEDS:
+                    cached = _stress34b_load_cache(
+                        report_name, model_seed, corr_seed, frac
+                    )
+                    if cached is not None:
+                        print(
+                            f'  [cached] {report_name:<13} '
+                            f'model_seed={model_seed} '
+                            f'NDCG@20={float(cached["NDCG@20"]):.6f}'
+                        )
+                        rows_34b.append(cached)
+                        continue
+
+                    model = load_main_model(internal_name, model_seed)
+                    model.eval()
+
+                    if internal_name == 'SAVRec':
+                        with torch.no_grad():
+                            model.item_evidence.copy_(
+                                state['item_evidence'].to(model.item_evidence.device)
+                            )
+
+                    metrics = evaluate_model_v6(
+                        model,
+                        selection_val_df,
+                        batch_size=VAL_BATCH_SIZE,
+                    )
+
+                    gate_mean = None
+                    if internal_name == 'SAVRec':
+                        gate_mean = float(
+                            mean_gate_for_eval(model, selection_val_df)
+                        )
+
+                    row = _stress34b_expected_signature(
+                        report_name, model_seed, corr_seed, frac
+                    )
+                    row.update({
+                        'mean_images_remaining': float(state['mean_images']),
+                        'mean_evidence_gate': gate_mean,
+                    })
+                    for metric in METRICS_V7:
+                        row[metric] = float(metrics[metric])
+
+                    _stress34b_save_cache(row)
+                    rows_34b.append(row)
+
+                    print(
+                        f'  {report_name:<13} model_seed={model_seed} '
+                        f'NDCG@20={row["NDCG@20"]:.6f}'
+                        + (
+                            f' gate={gate_mean:.6f}'
+                            if gate_mean is not None else ''
+                        )
+                    )
+
+                    del model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+finally:
+    # Restore canonical state even if any evaluation raises an exception.
+    img_3d = global_img_3d_before
+    img_msk = global_img_msk_before
+    hotel_mean = global_hotel_mean_before
+
+    assert torch.equal(img_msk.bool(), CANONICAL_IMG_MSK.bool())
+    assert torch.allclose(img_3d.float(), CANONICAL_IMG_3D.float(), atol=0, rtol=0)
+    assert torch.allclose(
+        hotel_mean.float(), CANONICAL_HOTEL_MEAN.float(), atol=1e-7, rtol=1e-6
+    )
+
+
+# ------------------------------------------------------------------------------
+# 4. Per-run table
+# ------------------------------------------------------------------------------
+stress_multiseed_per_run_df = pd.DataFrame(rows_34b)
+
+# Safety / completeness checks.
+expected_corrupted_rows = (
+    2 * len(SEEDS) * len(MULTI_STRESS_SEEDS) * (len(MULTI_STRESS_LEVELS) - 1)
+)
+expected_clean_rows = 2 * len(SEEDS)
+assert len(stress_multiseed_per_run_df) == (
+    expected_clean_rows + expected_corrupted_rows
+), (
+    len(stress_multiseed_per_run_df),
+    expected_clean_rows + expected_corrupted_rows,
+)
+
+assert not stress_multiseed_per_run_df.duplicated(
+    ['model', 'model_seed', 'corruption_seed', 'removal_fraction']
+).any()
+
+stress_multiseed_per_run_df.to_csv(
+    MULTI_STRESS_PER_RUN_PATH, index=False
+)
+
+
+# ------------------------------------------------------------------------------
+# 5. First average corruption randomness WITHIN each frozen model seed
+# ------------------------------------------------------------------------------
+modelseed_avg_rows = []
+for (model_name, model_seed, frac), d in stress_multiseed_per_run_df.groupby(
+    ['model', 'model_seed', 'removal_fraction'], sort=True
+):
+    out = {
+        'model': model_name,
+        'model_seed': int(model_seed),
+        'removal_fraction': float(frac),
+        'corruption_replicates': int(len(d)),
+        'mean_images_remaining': float(d['mean_images_remaining'].mean()),
+    }
+    for metric in METRICS_V7:
+        vals = d[metric].to_numpy(dtype=float)
+        out[metric] = float(vals.mean())
+        out[f'{metric}_corruption_sd'] = (
+            float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+        )
+
+    if model_name == 'SAVRec':
+        g = d['mean_evidence_gate'].astype(float).to_numpy()
+        out['mean_evidence_gate'] = float(g.mean())
+        out['evidence_gate_corruption_sd'] = (
+            float(g.std(ddof=1)) if len(g) > 1 else 0.0
+        )
+    else:
+        out['mean_evidence_gate'] = np.nan
+        out['evidence_gate_corruption_sd'] = np.nan
+
+    modelseed_avg_rows.append(out)
+
+stress_multiseed_modelseed_avg_df = pd.DataFrame(modelseed_avg_rows)
+stress_multiseed_modelseed_avg_df.to_csv(
+    MULTI_STRESS_MODELSEED_AVG_PATH, index=False
+)
+
+# Every model/removal level must now have exactly the 3 frozen model seeds.
+for (model_name, frac), d in stress_multiseed_modelseed_avg_df.groupby(
+    ['model', 'removal_fraction']
+):
+    assert set(d['model_seed'].astype(int)) == set(SEEDS), (model_name, frac)
+
+
+# ------------------------------------------------------------------------------
+# 6. Main paper-style summary: mean ± SD across MODEL SEEDS
+# ------------------------------------------------------------------------------
+summary_rows = []
+for (model_name, frac), d in stress_multiseed_modelseed_avg_df.groupby(
+    ['model', 'removal_fraction'], sort=True
+):
+    out = {
+        'model': model_name,
+        'removal_fraction': float(frac),
+        'model_seeds': int(d['model_seed'].nunique()),
+        'corruption_seeds': (
+            1 if float(frac) == 0.0 else len(MULTI_STRESS_SEEDS)
+        ),
+        'mean_images_remaining': float(d['mean_images_remaining'].mean()),
+    }
+
+    for metric in METRICS_V7:
+        vals = d[metric].to_numpy(dtype=float)
+        out[f'{metric}_mean'] = float(vals.mean())
+        out[f'{metric}_model_sd'] = float(vals.std(ddof=1))
+        out[f'{metric}_mean_within_model_corruption_sd'] = float(
+            d[f'{metric}_corruption_sd'].mean()
+        )
+
+    if model_name == 'SAVRec':
+        gates = d['mean_evidence_gate'].to_numpy(dtype=float)
+        out['evidence_gate_mean'] = float(gates.mean())
+        out['evidence_gate_model_sd'] = float(gates.std(ddof=1))
+        out['evidence_gate_mean_within_model_corruption_sd'] = float(
+            d['evidence_gate_corruption_sd'].mean()
+        )
+    else:
+        out['evidence_gate_mean'] = np.nan
+        out['evidence_gate_model_sd'] = np.nan
+        out['evidence_gate_mean_within_model_corruption_sd'] = np.nan
+
+    summary_rows.append(out)
+
+stress_multiseed_summary_df = pd.DataFrame(summary_rows)
+
+# Relative NDCG@20 drop from the clean value of the SAME model.
+stress_multiseed_summary_df['NDCG@20_relative_drop'] = np.nan
+for model_name, d in stress_multiseed_summary_df.groupby('model'):
+    clean = d.loc[
+        np.isclose(d['removal_fraction'].astype(float), 0.0),
+        'NDCG@20_mean',
+    ]
+    assert len(clean) == 1
+    clean_value = float(clean.iloc[0])
+    idx = stress_multiseed_summary_df['model'] == model_name
+    stress_multiseed_summary_df.loc[idx, 'NDCG@20_relative_drop'] = (
+        clean_value
+        - stress_multiseed_summary_df.loc[idx, 'NDCG@20_mean']
+    ) / clean_value
+
+stress_multiseed_summary_df.to_csv(
+    MULTI_STRESS_SUMMARY_PATH, index=False
+)
+
+
+# ------------------------------------------------------------------------------
+# 7. Separate corruption-seed variability summary
+# ------------------------------------------------------------------------------
+# For each corruption seed, first average the three frozen MODEL seeds. This lets
+# us see how much the stress result changes solely because a different image subset
+# happened to be retained.
+corruption_rows = []
+corrupted_only = stress_multiseed_per_run_df[
+    stress_multiseed_per_run_df['removal_fraction'].astype(float) > 0
+].copy()
+
+for (model_name, corr_seed, frac), d in corrupted_only.groupby(
+    ['model', 'corruption_seed', 'removal_fraction'], sort=True
+):
+    out = {
+        'model': model_name,
+        'corruption_seed': int(corr_seed),
+        'removal_fraction': float(frac),
+        'model_seeds': int(d['model_seed'].nunique()),
+        'mean_images_remaining': float(d['mean_images_remaining'].mean()),
+    }
+    assert out['model_seeds'] == len(SEEDS)
+    for metric in METRICS_V7:
+        out[metric] = float(d[metric].mean())
+    if model_name == 'SAVRec':
+        out['mean_evidence_gate'] = float(d['mean_evidence_gate'].mean())
+    else:
+        out['mean_evidence_gate'] = np.nan
+    corruption_rows.append(out)
+
+stress_multiseed_corruption_df = pd.DataFrame(corruption_rows)
+stress_multiseed_corruption_df.to_csv(
+    MULTI_STRESS_CORRUPTION_SUMMARY_PATH, index=False
+)
+
+
+# ------------------------------------------------------------------------------
+# 8. Save manifest BEFORE displaying results
+# ------------------------------------------------------------------------------
+manifest_34b = {
+    'version': MULTI_STRESS_VERSION,
+    'split': 'validation',
+    'frozen_model_seeds': [int(x) for x in SEEDS],
+    'corruption_seeds': [int(x) for x in MULTI_STRESS_SEEDS],
+    'removal_fractions': [float(x) for x in MULTI_STRESS_LEVELS],
+    'nested_masks_within_each_corruption_seed': True,
+    'clean_rows_reused_from_cell_34': True,
+    'models': ['Backbone-only', 'SAVRec'],
+    'model_retraining': False,
+    'hyperparameter_selection': False,
+    'test_metrics_computed': False,
+    'aggregation': (
+        'average corruption seeds within each frozen model seed, then report '
+        'mean±SD across model seeds'
+    ),
+    'files': {
+        'per_run': MULTI_STRESS_PER_RUN_PATH,
+        'modelseed_avg': MULTI_STRESS_MODELSEED_AVG_PATH,
+        'summary': MULTI_STRESS_SUMMARY_PATH,
+        'corruption_seed_summary': MULTI_STRESS_CORRUPTION_SUMMARY_PATH,
+        'cache_dir': MULTI_STRESS_CACHE_DIR,
+    },
+}
+with open(MULTI_STRESS_MANIFEST_PATH, 'w') as f:
+    json.dump(manifest_34b, f, indent=2)
+
+
+# ------------------------------------------------------------------------------
+# 9. Display concise results
+# ------------------------------------------------------------------------------
+_display_cols = [
+    'model', 'removal_fraction', 'model_seeds', 'corruption_seeds',
+    'mean_images_remaining',
+    'HR@20_mean', 'HR@20_model_sd',
+    'NDCG@20_mean', 'NDCG@20_model_sd',
+    'NDCG@20_mean_within_model_corruption_sd',
+    'MRR@20_mean', 'MRR@20_model_sd',
+    'evidence_gate_mean', 'evidence_gate_model_sd',
+    'NDCG@20_relative_drop',
+]
+
+print('\nMULTI-SEED VALIDATION STRESS SUMMARY')
+display(
+    stress_multiseed_summary_df[_display_cols]
+    .sort_values(['removal_fraction', 'model'])
+    .reset_index(drop=True)
+)
+
+# Difference SAVRec - Backbone at every removal level.
+_pivot = stress_multiseed_summary_df.pivot(
+    index='removal_fraction', columns='model', values='NDCG@20_mean'
+).reset_index()
+assert {'Backbone-only', 'SAVRec'}.issubset(_pivot.columns)
+_pivot['SAVRec_minus_Backbone_NDCG@20'] = (
+    _pivot['SAVRec'] - _pivot['Backbone-only']
+)
+
+print('\nSAVRec − BACKBONE NDCG@20 BY REMOVAL LEVEL')
+display(_pivot.sort_values('removal_fraction').reset_index(drop=True))
+
+print('\nSaved:')
+for _p in [
+    MULTI_STRESS_PER_RUN_PATH,
+    MULTI_STRESS_MODELSEED_AVG_PATH,
+    MULTI_STRESS_SUMMARY_PATH,
+    MULTI_STRESS_CORRUPTION_SUMMARY_PATH,
+    MULTI_STRESS_MANIFEST_PATH,
+]:
+    print('  ', _p)
+
+print('\n✅ Cell 34B complete.')
+print('✅ Frozen checkpoints only; no model retraining.')
+print('✅ Five deterministic corruption seeds evaluated on VALIDATION only.')
+print('✅ No test metric computed.')
+print('✅ Canonical visual tensors restored.')
+print('=' * 100)
+
+# %% PUBLIC NOTEBOOK CELL 37
+# ==============================================================================
+# CELL 35 — FINAL ANALYSIS FREEZE BEFORE CURRENT-V7 TEST EVALUATION
+# ==============================================================================
+print('=' * 100)
+print('CELL 35 — FINAL ANALYSIS FREEZE BEFORE CURRENT-V7 TEST EVALUATION')
+print('=' * 100)
+
+import os, json, hashlib
+from datetime import datetime, timezone
+
+
+def sha256_file_v7(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+# Required post-validation artifacts.  Cell 34B supersedes the single-realization
+# Cell-34 robustness table for final robustness reporting.
+required_analysis_files = [
+    ABLATION_VAL_PER_SEED_PATH,
+    ABLATION_VAL_SUMMARY_PATH,
+    GATE_VAL_PATH,
+    GATE_CORR_PATH,
+    GATE_BINS_PATH,
+    MULTI_STRESS_PER_RUN_PATH,
+    MULTI_STRESS_MODELSEED_AVG_PATH,
+    MULTI_STRESS_SUMMARY_PATH,
+    MULTI_STRESS_CORRUPTION_SUMMARY_PATH,
+    MULTI_STRESS_MANIFEST_PATH,
+]
+for p in required_analysis_files:
+    assert os.path.exists(p), p
+
+# Verify the multi-seed stress protocol BEFORE test is touched.
+with open(MULTI_STRESS_MANIFEST_PATH, 'r') as f:
+    stress34b_manifest = json.load(f)
+
+assert stress34b_manifest['version'] == MULTI_STRESS_VERSION
+assert stress34b_manifest['split'] == 'validation'
+assert stress34b_manifest['frozen_model_seeds'] == [42, 1, 7]
+assert stress34b_manifest['corruption_seeds'] == [2026, 2027, 2028, 2029, 2030]
+assert stress34b_manifest['removal_fractions'] == [0.0, 0.25, 0.5, 0.75]
+assert stress34b_manifest['nested_masks_within_each_corruption_seed'] is True
+assert stress34b_manifest['model_retraining'] is False
+assert stress34b_manifest['hyperparameter_selection'] is False
+assert stress34b_manifest['test_metrics_computed'] is False
+
+# Verify the SAVRec validation ablation TABLE using its saved/reporting schema.
+# Cell 32 writes paper-facing labels into the CSV (not the internal training codes).
+expected_ablation_report_labels = {
+    'Backbone-only',
+    'Full SAVRec',
+    *[DISPLAY_NAME[v] for v in ABLATION_VARIANTS],
+    DISPLAY_NAME[SHUFFLE_VARIANT],
+}
+_ab = pd.read_csv(ABLATION_VAL_PER_SEED_PATH)
+actual_ablation_report_labels = set(_ab['variant'].astype(str))
+assert actual_ablation_report_labels == expected_ablation_report_labels, (
+    actual_ablation_report_labels, expected_ablation_report_labels
+)
+assert len(_ab) == len(expected_ablation_report_labels) * len(SEEDS), (
+    len(_ab), len(expected_ablation_report_labels) * len(SEEDS)
+)
+assert not _ab.duplicated(['variant', 'seed']).any(), (
+    'Duplicate variant/seed rows found in ablation validation CSV'
+)
+for v, d in _ab.groupby('variant', sort=False):
+    assert set(d['seed'].astype(int).tolist()) == set(SEEDS), (
+        v, d['seed'].tolist(), SEEDS
+    )
+
+# Keep both internal codes and report labels in the freeze manifest.
+FROZEN_ABLATION_INTERNAL_CODES = list(ABLATION_VARIANTS) + [SHUFFLE_VARIANT]
+FROZEN_ABLATION_REPORT_LABELS = sorted(expected_ablation_report_labels)
+
+# Predefine final significance analyses BEFORE test evaluation.
+FINAL_SIGNIFICANCE_COMPARISONS = [
+    ('SAVRec', 'Backbone-only'),
+    ('SAVRec', 'SMORE'),
+]
+FINAL_SIGNIFICANCE_METRICS = ['NDCG@20', 'HR@20']
+FINAL_BOOTSTRAP_RESAMPLES = 10_000
+FINAL_BOOTSTRAP_SEED = 2026
+
+# Freeze the exact test-time robustness protocol now.
+FINAL_STRESS_MODEL_SEEDS = [42, 1, 7]
+FINAL_STRESS_CORRUPTION_SEEDS = [2026, 2027, 2028, 2029, 2030]
+FINAL_STRESS_LEVELS = [0.0, 0.25, 0.50, 0.75]
+FINAL_STRESS_MODELS = ['Backbone-only', 'SAVRec']
+
+FINAL_ANALYSIS_FREEZE_PATH = os.path.join(
+    ANALYSIS_DIR,
+    'cell35_final_analysis_freeze_before_test_v5.json'
+)
+
+freeze_payload = {
+    'created_utc': datetime.now(timezone.utc).isoformat(),
+    'postval_version': POSTVAL_VERSION,
+    'stage': 'all_analysis_choices_frozen_before_current_v7_test_evaluation',
+    'main_model_seeds': [int(x) for x in SEEDS],
+    'ablation_internal_codes': FROZEN_ABLATION_INTERNAL_CODES,
+    'ablation_report_labels': FROZEN_ABLATION_REPORT_LABELS,
+    'visual_stress_protocol': {
+        'model_seeds': FINAL_STRESS_MODEL_SEEDS,
+        'corruption_seeds': FINAL_STRESS_CORRUPTION_SEEDS,
+        'removal_fractions': FINAL_STRESS_LEVELS,
+        'models': FINAL_STRESS_MODELS,
+        'nested_masks_within_corruption_seed': True,
+        'aggregation': (
+            'average corruption seeds within each frozen model seed, '
+            'then report mean±SD across model seeds'
+        ),
+        'validation_protocol_source': MULTI_STRESS_MANIFEST_PATH,
+    },
+    'significance': {
+        'comparisons': [list(x) for x in FINAL_SIGNIFICANCE_COMPARISONS],
+        'metrics': FINAL_SIGNIFICANCE_METRICS,
+        'bootstrap_resamples': FINAL_BOOTSTRAP_RESAMPLES,
+        'bootstrap_seed': FINAL_BOOTSTRAP_SEED,
+        'paired_unit': 'test user after averaging the three model seeds',
+        'multiple_testing': 'Holm over the four predeclared tests',
+    },
+    'analysis_hashes': {
+        os.path.basename(p): sha256_file_v7(p)
+        for p in required_analysis_files
+    },
+    'test_used_for_any_cell_30_35_choice': False,
+    'historical_test_previously_inspected_in_prior_development': True,
+    'paper_language_note': (
+        'Do not describe the historical test split as untouched/sealed. '
+        'Current V7 checkpoint selection, ablations, robustness-protocol design, '
+        'and significance choices were validation-only before Cell 36.'
+    ),
+}
+
+with open(FINAL_ANALYSIS_FREEZE_PATH, 'w') as f:
+    json.dump(freeze_payload, f, indent=2)
+
+print('✅ Cell 35 freeze complete.')
+print('✅ 5-seed robustness protocol frozen BEFORE test evaluation.')
+print('✅ Significance comparisons/metrics frozen BEFORE test evaluation.')
+print('✅ Cell 36 may now evaluate test_df. Do not change Cells 30–35 afterward.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 38
+# ==============================================================================
+# CELL 36 — FINAL CURRENT-V7 TEST EVALUATION + FROZEN MULTI-SEED STRESS TEST
+# ==============================================================================
+print('=' * 100)
+print('CELL 36 — FINAL CURRENT-V7 TEST EVALUATION')
+print('=' * 100)
+
+assert os.path.exists(FINAL_ANALYSIS_FREEZE_PATH)
+TEST_EVAL_BATCH_SIZE = int(VAL_BATCH_SIZE)
+
+
+def load_reference_model_v3(name, seed):
+    cfg = REFERENCE_SELECTED_CONFIG[name]
+    pt, js = _final_paths(name, seed)
+    assert os.path.exists(pt) and os.path.exists(js)
+    with open(js, 'r') as f:
+        meta = json.load(f)
+    assert meta.get('implementation_version') == REFERENCE_IMPLEMENTATION_VERSION
+    assert meta.get('stage') == 'final_three_seed_validation_training'
+    assert meta.get('model') == name
+    assert int(meta.get('seed')) == int(seed)
+    assert meta['config'] == cfg
+    assert meta.get('test_metrics_computed') is False
+    assert meta.get('test_used_for_selection') is False
+    m = make_reference_model(name, cfg).to(DEVICE)
+    m.load_state_dict(load_torch_state(pt, DEVICE), strict=True)
+    m.eval()
+    return m
+
+
+def load_ablation_model(v, seed):
+    if v == SHUFFLE_VARIANT:
+        u, i = make_shuffled_evidence(seed)
+    else:
+        u, i = make_evidence_variant(v)
+    m = make_savrec(user_evidence=u, item_evidence=i).to(DEVICE)
+    pt, js = ablation_paths(v, seed)
+    assert os.path.exists(pt) and os.path.exists(js)
+    with open(js, 'r') as f:
+        meta = json.load(f)
+    assert meta.get('postval_version') == POSTVAL_VERSION
+    assert meta.get('variant') == v
+    assert int(meta.get('seed')) == int(seed)
+    assert meta.get('evidence_signature') == evidence_signature(u, i)
+    assert meta.get('test_metrics_computed') is False
+    m.load_state_dict(load_torch_state(pt, DEVICE), strict=True)
+    m.eval()
+    return m
+
+
+# ------------------------------------------------------------------------------
+# A. Standard full-catalog test evaluation
+# ------------------------------------------------------------------------------
+test_user_frames = []
+test_seed_rows = []
+
+
+def eval_store(model, label, seed):
+    d = evaluate_model_user_metrics(
+        model,
+        test_df,
+        batch_size=TEST_EVAL_BATCH_SIZE
+    ).copy()
+    d.insert(0, 'seed', int(seed))
+    d.insert(0, 'model', label)
+    test_user_frames.append(d)
+
+    row = {
+        'model': label,
+        'seed': int(seed),
+        'n_test_users': int(len(d)),
+    }
+    row.update({m: float(d[m].mean()) for m in METRICS_V7})
+    test_seed_rows.append(row)
+    print(
+        f'{label:<30} seed={seed:<3} | '
+        f'HR@20={row["HR@20"]:.6f} '
+        f'NDCG@20={row["NDCG@20"]:.6f} '
+        f'MRR@20={row["MRR@20"]:.6f}'
+    )
+
+
+# Final main models.
+for name in ['LightGCN', 'Text-Only', 'VBPR', 'SAVRec', 'UVCRec-MG-Attn']:
+    for seed in SEEDS:
+        model = load_main_model(name, seed)
+        label = 'Backbone-only' if name == 'UVCRec-MG-Attn' else name
+        eval_store(model, label, seed)
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+# Reference-faithful final baselines.
+for name, label in [
+    ('MMGCN-Ref', 'MMGCN'),
+    ('BM3-Ref', 'BM3'),
+    ('SMORE', 'SMORE'),
+]:
+    for seed in SEEDS:
+        model = load_reference_model_v3(name, seed)
+        eval_store(model, label, seed)
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+# Deterministic Most-Popular.
+mp = popularity_user_metrics(test_df).copy()
+mp.insert(0, 'seed', -1)
+mp.insert(0, 'model', 'Most-Popular')
+test_user_frames.append(mp)
+row = {
+    'model': 'Most-Popular',
+    'seed': -1,
+    'n_test_users': int(len(mp)),
+}
+row.update({m: float(mp[m].mean()) for m in METRICS_V7})
+test_seed_rows.append(row)
+
+# Frozen SAVRec ablations / shuffled-evidence control.
+for v in ABLATION_VARIANTS + [SHUFFLE_VARIANT]:
+    for seed in SEEDS:
+        model = load_ablation_model(v, seed)
+        eval_store(model, DISPLAY_NAME[v], seed)
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+test_user_metrics_df = pd.concat(test_user_frames, ignore_index=True)
+test_per_seed_df = pd.DataFrame(test_seed_rows)
+
+TEST_USER_METRICS_PATH = os.path.join(
+    RESULT_DIR, 'final_v7_test_user_metrics_v5.csv'
+)
+TEST_PER_SEED_PATH = os.path.join(
+    RESULT_DIR, 'final_v7_test_per_seed_v5.csv'
+)
+test_user_metrics_df.to_csv(TEST_USER_METRICS_PATH, index=False)
+test_per_seed_df.to_csv(TEST_PER_SEED_PATH, index=False)
+
+summary_rows = []
+for model_name, d in test_per_seed_df.groupby('model', sort=False):
+    out = {
+        'model': model_name,
+        'seeds': 0 if model_name == 'Most-Popular' else int((d['seed'] >= 0).sum()),
+    }
+    for metric in METRICS_V7:
+        a = d[metric].to_numpy(dtype=float)
+        out[f'{metric}_mean'] = float(a.mean())
+        out[f'{metric}_sd'] = float(a.std(ddof=1)) if len(a) > 1 else 0.0
+    summary_rows.append(out)
+
+test_summary_df = pd.DataFrame(summary_rows).sort_values(
+    'NDCG@20_mean', ascending=False
+).reset_index(drop=True)
+
+TEST_SUMMARY_PATH = os.path.join(
+    RESULT_DIR, 'final_v7_test_mean_sd_v5.csv'
+)
+test_summary_df.to_csv(TEST_SUMMARY_PATH, index=False)
+
+print('\nFINAL STANDARD TEST SUMMARY')
+display(test_summary_df)
+
+
+# ------------------------------------------------------------------------------
+# B. Apply the EXACT Cell-34B multi-seed stress protocol to test
+# ------------------------------------------------------------------------------
+print('\n' + '=' * 100)
+print('FROZEN MULTI-SEED VISUAL STRESS PROTOCOL — TEST')
+print('=' * 100)
+
+TEST_STRESS_VERSION = 'savrec_v7_test_visual_stress_multiseed_v1'
+TEST_STRESS_CACHE_DIR = os.path.join(
+    ARTIFACT_DIR, 'visual_stress_test_multiseed_v1_cache'
+)
+os.makedirs(TEST_STRESS_CACHE_DIR, exist_ok=True)
+
+
+def _test_stress_cache_path(model_name, model_seed, corruption_seed, frac):
+    safe = model_name.lower().replace(' ', '_').replace('-', '_')
+    pct = int(round(float(frac) * 100))
+    return os.path.join(
+        TEST_STRESS_CACHE_DIR,
+        f'{safe}_modelseed_{int(model_seed)}_corrseed_{int(corruption_seed)}_remove_{pct}.json'
+    )
+
+
+def _expected_test_stress_signature(model_name, model_seed, corruption_seed, frac):
+    return {
+        'version': TEST_STRESS_VERSION,
+        'split': 'test',
+        'model': model_name,
+        'model_seed': int(model_seed),
+        'corruption_seed': int(corruption_seed),
+        'removal_fraction': float(frac),
+        'test_users': int(test_df['user_id'].astype(str).nunique()),
+        'test_interactions': int(len(test_df)),
+        'protocol_frozen_before_test': True,
+    }
+
+
+def _load_test_stress_cache(model_name, model_seed, corruption_seed, frac):
+    path = _test_stress_cache_path(
+        model_name, model_seed, corruption_seed, frac
+    )
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            row = json.load(f)
+    except Exception:
+        return None
+    expected = _expected_test_stress_signature(
+        model_name, model_seed, corruption_seed, frac
+    )
+    for k, v in expected.items():
+        if row.get(k) != v:
+            return None
+    for metric in METRICS_V7:
+        if metric not in row or not np.isfinite(float(row[metric])):
+            return None
+    if model_name == 'SAVRec':
+        if not np.isfinite(float(row.get('mean_evidence_gate', np.nan))):
+            return None
+    return row
+
+
+def _save_test_stress_cache(row):
+    path = _test_stress_cache_path(
+        row['model'], row['model_seed'], row['corruption_seed'],
+        row['removal_fraction']
+    )
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(row, f, indent=2, allow_nan=False)
+    os.replace(tmp, path)
+
+
+stress_test_rows = []
+
+
+# Recompute the CLEAN TEST evidence gate directly on test_df. This is reporting-only
+# and does not alter any recommendation score or checkpoint.
+clean_test_gate_by_seed = {}
+for seed in SEEDS:
+    _m = load_main_model('SAVRec', seed)
+    _m.eval()
+    clean_test_gate_by_seed[int(seed)] = float(mean_gate_for_eval(_m, test_df))
+    del _m
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# Clean 0% rows are exactly the already-computed standard test metrics.
+for label in ['Backbone-only', 'SAVRec']:
+    clean = test_per_seed_df[
+        (test_per_seed_df['model'] == label) &
+        (test_per_seed_df['seed'] >= 0)
+    ].copy()
+    assert set(clean['seed'].astype(int)) == set(SEEDS)
+    for _, r0 in clean.iterrows():
+        row = _expected_test_stress_signature(
+            label, int(r0['seed']), -1, 0.0
+        )
+        row['mean_images_remaining'] = float(
+            CANONICAL_IMG_MSK.sum(1).float().mean().item()
+        )
+        row['mean_evidence_gate'] = (
+            float(clean_test_gate_by_seed[int(r0['seed'])])
+            if label == 'SAVRec' else None
+        )
+        for metric in METRICS_V7:
+            row[metric] = float(r0[metric])
+        stress_test_rows.append(row)
+
+# Canonical global visual state must be intact before corruption starts.
+assert torch.equal(img_msk.bool(), CANONICAL_IMG_MSK.bool())
+assert torch.allclose(img_3d.float(), CANONICAL_IMG_3D.float(), atol=0, rtol=0)
+assert torch.allclose(
+    hotel_mean.float(), CANONICAL_HOTEL_MEAN.float(), atol=1e-7, rtol=1e-6
+)
+
+_global_img_3d = img_3d
+_global_img_msk = img_msk
+_global_hotel_mean = hotel_mean
+
+try:
+    for corr_seed in FINAL_STRESS_CORRUPTION_SEEDS:
+        print(f'\nCorruption seed {corr_seed}')
+        for frac in FINAL_STRESS_LEVELS[1:]:
+            state = make_multiseed_corrupted_visual_state(frac, corr_seed)
+            img_3d = state['img_3d']
+            img_msk = state['img_msk']
+            hotel_mean = state['hotel_mean']
+            print(
+                f'  removal={frac:.0%} | '
+                f'mean images={state["mean_images"]:.3f}'
+            )
+
+            for internal_name, report_name in [
+                ('UVCRec-MG-Attn', 'Backbone-only'),
+                ('SAVRec', 'SAVRec'),
+            ]:
+                for model_seed in SEEDS:
+                    cached = _load_test_stress_cache(
+                        report_name, model_seed, corr_seed, frac
+                    )
+                    if cached is not None:
+                        stress_test_rows.append(cached)
+                        print(
+                            f'    [cached] {report_name:<13} '
+                            f'seed={model_seed} '
+                            f'NDCG@20={float(cached["NDCG@20"]):.6f}'
+                        )
+                        continue
+
+                    model = load_main_model(internal_name, model_seed)
+                    model.eval()
+
+                    if internal_name == 'SAVRec':
+                        with torch.no_grad():
+                            model.item_evidence.copy_(
+                                state['item_evidence'].to(model.item_evidence.device)
+                            )
+
+                    metrics = evaluate_model_v6(
+                        model,
+                        test_df,
+                        batch_size=TEST_EVAL_BATCH_SIZE,
+                    )
+                    gate_mean = None
+                    if internal_name == 'SAVRec':
+                        gate_mean = float(mean_gate_for_eval(model, test_df))
+
+                    row = _expected_test_stress_signature(
+                        report_name, model_seed, corr_seed, frac
+                    )
+                    row.update({
+                        'mean_images_remaining': float(state['mean_images']),
+                        'mean_evidence_gate': gate_mean,
+                    })
+                    for metric in METRICS_V7:
+                        row[metric] = float(metrics[metric])
+
+                    _save_test_stress_cache(row)
+                    stress_test_rows.append(row)
+                    print(
+                        f'    {report_name:<13} seed={model_seed} '
+                        f'NDCG@20={row["NDCG@20"]:.6f}'
+                        + (
+                            f' gate={gate_mean:.6f}'
+                            if gate_mean is not None else ''
+                        )
+                    )
+
+                    del model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+finally:
+    img_3d = _global_img_3d
+    img_msk = _global_img_msk
+    hotel_mean = _global_hotel_mean
+    assert torch.equal(img_msk.bool(), CANONICAL_IMG_MSK.bool())
+    assert torch.allclose(img_3d.float(), CANONICAL_IMG_3D.float(), atol=0, rtol=0)
+    assert torch.allclose(
+        hotel_mean.float(), CANONICAL_HOTEL_MEAN.float(), atol=1e-7, rtol=1e-6
+    )
+
+
+stress_test_multiseed_per_run_df = pd.DataFrame(stress_test_rows)
+assert not stress_test_multiseed_per_run_df.duplicated(
+    ['model', 'model_seed', 'corruption_seed', 'removal_fraction']
+).any()
+
+expected_rows = 2 * len(SEEDS) + (
+    2 * len(SEEDS) * len(FINAL_STRESS_CORRUPTION_SEEDS) * 3
+)
+assert len(stress_test_multiseed_per_run_df) == expected_rows, (
+    len(stress_test_multiseed_per_run_df), expected_rows
+)
+
+STRESS_TEST_MULTI_PER_RUN_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_test_multiseed_per_run_v4.csv'
+)
+stress_test_multiseed_per_run_df.to_csv(
+    STRESS_TEST_MULTI_PER_RUN_PATH, index=False
+)
+
+# Average corruption seeds within each frozen model seed.
+modelseed_rows = []
+for (model_name, model_seed, frac), d in stress_test_multiseed_per_run_df.groupby(
+    ['model', 'model_seed', 'removal_fraction'], sort=True
+):
+    out = {
+        'model': model_name,
+        'model_seed': int(model_seed),
+        'removal_fraction': float(frac),
+        'corruption_replicates': int(len(d)),
+        'mean_images_remaining': float(d['mean_images_remaining'].mean()),
+    }
+    for metric in METRICS_V7:
+        vals = d[metric].to_numpy(dtype=float)
+        out[metric] = float(vals.mean())
+        out[f'{metric}_corruption_sd'] = (
+            float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+        )
+    if model_name == 'SAVRec':
+        vals = d['mean_evidence_gate'].astype(float).to_numpy()
+        out['mean_evidence_gate'] = float(vals.mean())
+        out['evidence_gate_corruption_sd'] = (
+            float(vals.std(ddof=1)) if len(vals) > 1 else 0.0
+        )
+    else:
+        out['mean_evidence_gate'] = np.nan
+        out['evidence_gate_corruption_sd'] = np.nan
+    modelseed_rows.append(out)
+
+stress_test_multiseed_modelseed_avg_df = pd.DataFrame(modelseed_rows)
+STRESS_TEST_MULTI_MODELSEED_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_test_multiseed_modelseed_avg_v4.csv'
+)
+stress_test_multiseed_modelseed_avg_df.to_csv(
+    STRESS_TEST_MULTI_MODELSEED_PATH, index=False
+)
+
+# Mean±SD across the three frozen model seeds.
+summary_rows = []
+for (model_name, frac), d in stress_test_multiseed_modelseed_avg_df.groupby(
+    ['model', 'removal_fraction'], sort=True
+):
+    assert set(d['model_seed'].astype(int)) == set(SEEDS)
+    out = {
+        'model': model_name,
+        'removal_fraction': float(frac),
+        'model_seeds': int(d['model_seed'].nunique()),
+        'corruption_seeds': (
+            1 if float(frac) == 0.0
+            else len(FINAL_STRESS_CORRUPTION_SEEDS)
+        ),
+        'mean_images_remaining': float(d['mean_images_remaining'].mean()),
+    }
+    for metric in METRICS_V7:
+        vals = d[metric].to_numpy(dtype=float)
+        out[f'{metric}_mean'] = float(vals.mean())
+        out[f'{metric}_model_sd'] = float(vals.std(ddof=1))
+        out[f'{metric}_mean_within_model_corruption_sd'] = float(
+            d[f'{metric}_corruption_sd'].mean()
+        )
+    if model_name == 'SAVRec':
+        gates = d['mean_evidence_gate'].to_numpy(dtype=float)
+        out['evidence_gate_mean'] = float(gates.mean())
+        out['evidence_gate_model_sd'] = float(gates.std(ddof=1))
+        out['evidence_gate_mean_within_model_corruption_sd'] = float(
+            d['evidence_gate_corruption_sd'].mean()
+        )
+    else:
+        out['evidence_gate_mean'] = np.nan
+        out['evidence_gate_model_sd'] = np.nan
+        out['evidence_gate_mean_within_model_corruption_sd'] = np.nan
+    summary_rows.append(out)
+
+stress_test_multiseed_summary_df = pd.DataFrame(summary_rows)
+stress_test_multiseed_summary_df['NDCG@20_relative_drop'] = np.nan
+for model_name, d in stress_test_multiseed_summary_df.groupby('model'):
+    clean = d.loc[
+        np.isclose(d['removal_fraction'].astype(float), 0.0),
+        'NDCG@20_mean'
+    ]
+    assert len(clean) == 1
+    clean_value = float(clean.iloc[0])
+    idx = stress_test_multiseed_summary_df['model'] == model_name
+    stress_test_multiseed_summary_df.loc[
+        idx, 'NDCG@20_relative_drop'
+    ] = (
+        clean_value - stress_test_multiseed_summary_df.loc[idx, 'NDCG@20_mean']
+    ) / clean_value
+
+STRESS_TEST_MULTI_SUMMARY_PATH = os.path.join(
+    RESULT_DIR, 'visual_stress_test_multiseed_summary_v4.csv'
+)
+stress_test_multiseed_summary_df.to_csv(
+    STRESS_TEST_MULTI_SUMMARY_PATH, index=False
+)
+
+print('\nFINAL MULTI-SEED TEST STRESS SUMMARY')
+display(
+    stress_test_multiseed_summary_df.sort_values(
+        ['removal_fraction', 'model']
+    ).reset_index(drop=True)
+)
+
+# Final manifest.
+TEST_MANIFEST_PATH = os.path.join(
+    ANALYSIS_DIR, 'final_v7_test_evaluation_manifest_v4.json'
+)
+with open(TEST_MANIFEST_PATH, 'w') as f:
+    json.dump({
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+        'analysis_freeze': FINAL_ANALYSIS_FREEZE_PATH,
+        'test_users': int(test_df['user_id'].astype(str).nunique()),
+        'test_interactions': int(len(test_df)),
+        'test_used_for_model_or_hyperparameter_selection': False,
+        'historical_test_previously_inspected_in_prior_development': True,
+        'standard_test_files': {
+            'user_metrics': TEST_USER_METRICS_PATH,
+            'per_seed': TEST_PER_SEED_PATH,
+            'mean_sd': TEST_SUMMARY_PATH,
+        },
+        'frozen_multiseed_stress_files': {
+            'per_run': STRESS_TEST_MULTI_PER_RUN_PATH,
+            'modelseed_avg': STRESS_TEST_MULTI_MODELSEED_PATH,
+            'summary': STRESS_TEST_MULTI_SUMMARY_PATH,
+            'cache_dir': TEST_STRESS_CACHE_DIR,
+        },
+    }, f, indent=2)
+
+print('✅ Cell 36 complete.')
+print('✅ Standard test + frozen 5-corruption-seed stress protocol evaluated.')
+print('✅ Do NOT retune/rebuild any model after seeing these values.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 39
+# ==============================================================================
+# CELL 37 — PREDECLARED PAIRED USER-LEVEL SIGNIFICANCE
+# ==============================================================================
+print('=' * 100)
+print('CELL 37 — PREDECLARED PAIRED USER-LEVEL SIGNIFICANCE')
+print('=' * 100)
+
+from scipy.stats import wilcoxon
+
+
+def user_seed_mean(df, model_name, metric):
+    z = df[(df['model'] == model_name) & (df['seed'] >= 0)].copy()
+    counts = z.groupby('user_id')['seed'].nunique()
+    assert len(counts) > 0
+    assert int(counts.min()) == len(SEEDS)
+    assert int(counts.max()) == len(SEEDS)
+    return z.groupby('user_id')[metric].mean().sort_index()
+
+
+def paired_bootstrap_ci(diff, n_boot=10_000, seed=2026):
+    diff = np.asarray(diff, dtype=float)
+    n = len(diff)
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_boot, dtype=np.float64)
+    chunk = 500
+    for start in range(0, n_boot, chunk):
+        b = min(chunk, n_boot - start)
+        idx = rng.integers(0, n, size=(b, n))
+        means[start:start + b] = diff[idx].mean(axis=1)
+    return tuple(np.percentile(means, [2.5, 97.5]))
+
+
+sig_rows = []
+for metric in FINAL_SIGNIFICANCE_METRICS:
+    for model_a, model_b in FINAL_SIGNIFICANCE_COMPARISONS:
+        x = user_seed_mean(test_user_metrics_df, model_a, metric)
+        y = user_seed_mean(test_user_metrics_df, model_b, metric)
+        ids = x.index.intersection(y.index)
+        assert len(ids) == test_df['user_id'].astype(str).nunique()
+
+        xa = x.loc[ids].to_numpy(dtype=float)
+        yb = y.loc[ids].to_numpy(dtype=float)
+        diff = xa - yb
+
+        lo, hi = paired_bootstrap_ci(
+            diff,
+            n_boot=FINAL_BOOTSTRAP_RESAMPLES,
+            seed=FINAL_BOOTSTRAP_SEED,
+        )
+
+        if np.allclose(diff, 0.0):
+            stat, p_raw = 0.0, 1.0
+        else:
+            w = wilcoxon(
+                diff,
+                zero_method='zsplit',
+                alternative='two-sided',
+                method='auto',
+            )
+            stat, p_raw = float(w.statistic), float(w.pvalue)
+
+        sig_rows.append({
+            'metric': metric,
+            'model_a': model_a,
+            'model_b': model_b,
+            'n_users': int(len(ids)),
+            'mean_a': float(xa.mean()),
+            'mean_b': float(yb.mean()),
+            'mean_difference_a_minus_b': float(diff.mean()),
+            'median_difference_a_minus_b': float(np.median(diff)),
+            'bootstrap_95ci_low': float(lo),
+            'bootstrap_95ci_high': float(hi),
+            'bootstrap_ci_excludes_zero': bool((lo > 0) or (hi < 0)),
+            'user_win_rate_a_gt_b': float((diff > 0).mean()),
+            'user_tie_rate': float((diff == 0).mean()),
+            'wilcoxon_statistic': stat,
+            'wilcoxon_p_raw': p_raw,
+        })
+
+significance_df = pd.DataFrame(sig_rows)
+
+# Holm correction over exactly the four predeclared tests.
+pvals = significance_df['wilcoxon_p_raw'].to_numpy(dtype=float)
+order = np.argsort(pvals)
+adj = np.empty(len(pvals), dtype=float)
+running = 0.0
+for rank, idx in enumerate(order):
+    corrected = min(1.0, (len(pvals) - rank) * pvals[idx])
+    running = max(running, corrected)
+    adj[idx] = running
+
+significance_df['wilcoxon_p_holm'] = adj
+significance_df['significant_holm_0.05'] = (
+    significance_df['wilcoxon_p_holm'] < 0.05
+)
+
+SIGNIFICANCE_PATH = os.path.join(
+    RESULT_DIR, 'final_v7_paired_significance_v5.csv'
+)
+significance_df.to_csv(SIGNIFICANCE_PATH, index=False)
+
+display(significance_df)
+print('✅ Cell 37 complete.')
+
+
+
+# %% PUBLIC NOTEBOOK CELL 40
+# ==============================================================================
+# CELL 38 — FINAL PAPER-READY TABLES / FIGURES / MANIFEST
+# ==============================================================================
+print('=' * 100)
+print('CELL 38 — FINAL PAPER-READY TABLES / FIGURES')
+print('=' * 100)
+
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------------------
+# 1. Main test table
+# ------------------------------------------------------------------------------
+MAIN_ORDER = [
+    'Most-Popular', 'LightGCN', 'Text-Only', 'VBPR',
+    'MMGCN', 'BM3', 'SMORE', 'SAVRec'
+]
+main_test_table = test_summary_df[
+    test_summary_df['model'].isin(MAIN_ORDER)
+].copy()
+main_test_table['order'] = main_test_table['model'].map(
+    {m: i for i, m in enumerate(MAIN_ORDER)}
+)
+main_test_table = main_test_table.sort_values('order').drop(columns='order')
+
+# ------------------------------------------------------------------------------
+# 2. Matched-backbone and ablation tables
+# ------------------------------------------------------------------------------
+backbone_test_table = test_summary_df[
+    test_summary_df['model'].isin(['Backbone-only', 'SAVRec'])
+].copy()
+
+ABL_ORDER = [
+    'Backbone-only',
+    'SAVRec − History',
+    'SAVRec − Popularity',
+    'SAVRec − Availability',
+    'SAVRec − Coherence',
+    'SAVRec + Shuffled Evidence',
+    'SAVRec',
+]
+
+test_ablation_table = test_summary_df[
+    test_summary_df['model'].isin(ABL_ORDER)
+].copy()
+test_ablation_table['order'] = test_ablation_table['model'].map(
+    {m: i for i, m in enumerate(ABL_ORDER)}
+)
+test_ablation_table = test_ablation_table.sort_values('order').drop(columns='order')
+
+# ------------------------------------------------------------------------------
+# 3. Robustness table — use MULTI-SEED frozen TEST protocol, not old Cell 34
+# ------------------------------------------------------------------------------
+paper_stress_test_table = stress_test_multiseed_summary_df.copy().sort_values(
+    ['removal_fraction', 'model']
+).reset_index(drop=True)
+
+# Also retain the validation multi-seed table as mechanism-development evidence.
+paper_stress_validation_table = stress_multiseed_summary_df.copy().sort_values(
+    ['removal_fraction', 'model']
+).reset_index(drop=True)
+
+# ------------------------------------------------------------------------------
+# 4. Save CSVs
+# ------------------------------------------------------------------------------
+PAPER_MAIN_TEST_PATH = os.path.join(
+    RESULT_DIR, 'paper_main_test_table_v5.csv'
+)
+PAPER_BACKBONE_TEST_PATH = os.path.join(
+    RESULT_DIR, 'paper_backbone_test_anchor_v5.csv'
+)
+PAPER_ABLATION_TEST_PATH = os.path.join(
+    RESULT_DIR, 'paper_savrec_ablation_test_table_v5.csv'
+)
+PAPER_STRESS_TEST_PATH = os.path.join(
+    RESULT_DIR, 'paper_visual_stress_test_multiseed_v5.csv'
+)
+PAPER_STRESS_VALIDATION_PATH = os.path.join(
+    RESULT_DIR, 'paper_visual_stress_validation_multiseed_v5.csv'
+)
+
+main_test_table.to_csv(PAPER_MAIN_TEST_PATH, index=False)
+backbone_test_table.to_csv(PAPER_BACKBONE_TEST_PATH, index=False)
+test_ablation_table.to_csv(PAPER_ABLATION_TEST_PATH, index=False)
+paper_stress_test_table.to_csv(PAPER_STRESS_TEST_PATH, index=False)
+paper_stress_validation_table.to_csv(
+    PAPER_STRESS_VALIDATION_PATH, index=False
+)
+
+# ------------------------------------------------------------------------------
+# 5. Main-model figure
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(10, 5))
+plt.bar(
+    main_test_table['model'],
+    main_test_table['NDCG@20_mean'],
+    yerr=main_test_table['NDCG@20_sd'],
+    capsize=4,
+)
+plt.ylabel('NDCG@20')
+plt.xlabel('Model')
+plt.title('Final V7 Test Performance')
+plt.xticks(rotation=35, ha='right')
+plt.tight_layout()
+MAIN_FIG_PATH = os.path.join(
+    FIGURE_DIR, 'main_test_ndcg20_v4.png'
+)
+plt.savefig(MAIN_FIG_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+
+# ------------------------------------------------------------------------------
+# 6. Final multi-seed test robustness figure
+# ------------------------------------------------------------------------------
+plt.figure(figsize=(7, 5))
+for model_name, d in paper_stress_test_table.groupby('model'):
+    d = d.sort_values('removal_fraction')
+    plt.errorbar(
+        d['removal_fraction'] * 100,
+        d['NDCG@20_mean'],
+        yerr=d['NDCG@20_model_sd'],
+        marker='o',
+        capsize=4,
+        label=model_name,
+    )
+plt.xlabel('Images removed (%)')
+plt.ylabel('NDCG@20')
+plt.title('Visual Availability Stress Test — 5 Corruption Seeds')
+plt.legend()
+plt.tight_layout()
+STRESS_FIG_PATH = os.path.join(
+    FIGURE_DIR, 'visual_stress_test_multiseed_ndcg20_v4.png'
+)
+plt.savefig(STRESS_FIG_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+
+# ------------------------------------------------------------------------------
+# 7. Final gate-response figure
+# ------------------------------------------------------------------------------
+gs = paper_stress_test_table[
+    paper_stress_test_table['model'] == 'SAVRec'
+].sort_values('removal_fraction')
+
+GATE_STRESS_FIG_PATH = None
+if 'evidence_gate_mean' in gs.columns:
+    plt.figure(figsize=(7, 5))
+    plt.errorbar(
+        gs['removal_fraction'] * 100,
+        gs['evidence_gate_mean'],
+        yerr=gs['evidence_gate_model_sd'],
+        marker='o',
+        capsize=4,
+    )
+    plt.xlabel('Images removed (%)')
+    plt.ylabel('Mean SAVRec evidence gate')
+    plt.title('SAVRec Gate Response to Reduced Visual Availability')
+    plt.tight_layout()
+    GATE_STRESS_FIG_PATH = os.path.join(
+        FIGURE_DIR, 'savrec_gate_vs_visual_removal_multiseed_v4.png'
+    )
+    plt.savefig(GATE_STRESS_FIG_PATH, dpi=300, bbox_inches='tight')
+    plt.show()
+
+# ------------------------------------------------------------------------------
+# 8. Export manifest
+# ------------------------------------------------------------------------------
+FINAL_EXPORT_MANIFEST_PATH = os.path.join(
+    ANALYSIS_DIR, 'paper_ready_export_manifest_v4.json'
+)
+with open(FINAL_EXPORT_MANIFEST_PATH, 'w') as f:
+    json.dump({
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+        'main_test_table': PAPER_MAIN_TEST_PATH,
+        'backbone_anchor': PAPER_BACKBONE_TEST_PATH,
+        'ablation_test_table': PAPER_ABLATION_TEST_PATH,
+        'stress_test_table_multiseed': PAPER_STRESS_TEST_PATH,
+        'stress_validation_table_multiseed': PAPER_STRESS_VALIDATION_PATH,
+        'significance_table': SIGNIFICANCE_PATH,
+        'main_figure': MAIN_FIG_PATH,
+        'stress_figure_multiseed': STRESS_FIG_PATH,
+        'gate_stress_figure_multiseed': GATE_STRESS_FIG_PATH,
+        'analysis_freeze': FINAL_ANALYSIS_FREEZE_PATH,
+        'test_manifest': TEST_MANIFEST_PATH,
+        'paper_language_warning': (
+            'Do not call the historical test split untouched/sealed; '
+            'current V7 selection/tuning and post-validation protocol freezing '
+            'used validation only.'
+        ),
+    }, f, indent=2)
+
+print('\nMAIN TEST TABLE')
+display(main_test_table)
+print('\nBACKBONE ANCHOR')
+display(backbone_test_table)
+print('\nTEST ABLATION TABLE')
+display(test_ablation_table)
+print('\nFINAL MULTI-SEED TEST STRESS TABLE')
+display(paper_stress_test_table)
+print('\nSIGNIFICANCE')
+display(significance_df)
+
+print('✅ Cells 35–38 complete.')
+print('✅ Final paper exports use the 5-corruption-seed stress protocol.')
+
+# %% PUBLIC NOTEBOOK CELL 42
+# ==============================================================================
+# CELL 39 — EXPLORATORY MECHANISM / SUBGROUP + COMPLEXITY ANALYSIS
+# ==============================================================================
+# IMPORTANT:
+#   - NO training.
+#   - NO checkpoint modification.
+#   - Uses VALIDATION only for new subgroup/mechanism analysis.
+#   - This analysis is exploratory/post-hoc and must be described that way.
+#   - Primary test results from Cells 36–38 remain unchanged.
+#
+# Goals:
+#   A) Determine whether SAVRec's gain over the matched backbone is concentrated
+#      in low-popularity / low-visual-evidence hotels.
+#   B) Visualize how the learned evidence gate changes across evidence strata.
+#   C) Quantify the parameter overhead of evidence regulation.
+# ==============================================================================
+
+print('=' * 100)
+print('CELL 39 — EXPLORATORY VALIDATION MECHANISM / SUBGROUP + COMPLEXITY ANALYSIS')
+print('=' * 100)
+
+import os, json, gc
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+
+_required = [
+    'SEEDS', 'selection_val_df', 'val_evidence_df',
+    'user2idx', 'item2idx', 'DEVICE',
+    'load_main_model', 'evaluate_model_user_metrics',
+    'RESULT_DIR', 'ARTIFACT_DIR', 'FIGURE_DIR'
+]
+_missing = [x for x in _required if x not in globals()]
+if _missing:
+    raise RuntimeError('Missing required objects: ' + ', '.join(_missing))
+
+os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+os.makedirs(FIGURE_DIR, exist_ok=True)
+
+CELL39_VERSION = 'savrec_v7_exploratory_mechanism_v1'
+
+PER_SEED_PATH = os.path.join(
+    RESULT_DIR, 'exploratory_validation_user_metrics_savrec_vs_backbone_v1.csv'
+)
+PER_USER_PATH = os.path.join(
+    RESULT_DIR, 'exploratory_validation_per_user_evidence_effects_v1.csv'
+)
+STRATIFIED_PATH = os.path.join(
+    RESULT_DIR, 'exploratory_validation_evidence_stratified_performance_v1.csv'
+)
+GATE_USER_PATH = os.path.join(
+    RESULT_DIR, 'exploratory_validation_target_gate_per_user_v1.csv'
+)
+GATE_STRATIFIED_PATH = os.path.join(
+    RESULT_DIR, 'exploratory_validation_gate_stratified_v1.csv'
+)
+COMPLEXITY_PATH = os.path.join(
+    RESULT_DIR, 'savrec_backbone_parameter_overhead_v1.csv'
+)
+MANIFEST_PATH = os.path.join(
+    ARTIFACT_DIR, 'cell39_exploratory_mechanism_manifest_v1.json'
+)
+
+# ------------------------------------------------------------------------------
+# 1. Build one-row-per-validation-user target evidence table
+# ------------------------------------------------------------------------------
+_val = selection_val_df.copy()
+_val['user_id'] = _val['user_id'].astype(str)
+_val['img_hotel_id'] = _val['img_hotel_id'].astype(str)
+
+_ev = val_evidence_df.copy()
+_ev['user_id'] = _ev['user_id'].astype(str)
+_ev['img_hotel_id'] = _ev['img_hotel_id'].astype(str)
+
+evidence_cols = [
+    'user_id', 'img_hotel_id',
+    'train_user_history',
+    'train_user_history_norm',
+    'train_popularity',
+    'visual_image_count',
+    'visual_availability',
+    'visual_coherence',
+]
+missing_evidence_cols = [c for c in evidence_cols if c not in _ev.columns]
+if missing_evidence_cols:
+    raise RuntimeError(
+        'val_evidence_df is missing columns: ' + ', '.join(missing_evidence_cols)
+    )
+
+target_evidence = _val[['user_id', 'img_hotel_id']].merge(
+    _ev[evidence_cols],
+    on=['user_id', 'img_hotel_id'],
+    how='left',
+    validate='one_to_one'
+)
+
+assert len(target_evidence) == len(_val)
+assert target_evidence['user_id'].nunique() == len(target_evidence)
+assert target_evidence[
+    ['train_popularity', 'visual_image_count', 'visual_availability', 'visual_coherence']
+].notna().all().all()
+
+def make_quartile_group(series):
+    s = pd.Series(series, index=series.index, dtype=float)
+    pct = s.rank(method='average', pct=True)
+    return pd.cut(
+        pct,
+        bins=[0.0, 0.25, 0.50, 0.75, 1.0000001],
+        labels=['Q1-low', 'Q2', 'Q3', 'Q4-high'],
+        include_lowest=True,
+        ordered=True
+    )
+
+target_evidence['popularity_group'] = make_quartile_group(
+    target_evidence['train_popularity']
+)
+target_evidence['availability_group'] = make_quartile_group(
+    target_evidence['visual_image_count']
+)
+target_evidence['coherence_group'] = make_quartile_group(
+    target_evidence['visual_coherence']
+)
+
+for c in ['popularity_group', 'availability_group', 'coherence_group']:
+    assert target_evidence[c].notna().all(), c
+
+# ------------------------------------------------------------------------------
+# 2. Frozen user-level VALIDATION metrics: SAVRec vs matched backbone
+# ------------------------------------------------------------------------------
+if os.path.exists(PER_SEED_PATH):
+    user_metric_seed_df = pd.read_csv(PER_SEED_PATH)
+    expected_models = {'SAVRec', 'Backbone-only'}
+    if (
+        set(user_metric_seed_df['model'].astype(str)) != expected_models
+        or set(user_metric_seed_df['seed'].astype(int)) != set(SEEDS)
+        or user_metric_seed_df['user_id'].astype(str).nunique() != len(target_evidence)
+    ):
+        print('Existing Cell-39 metric cache is incompatible; recomputing.')
+        user_metric_seed_df = None
+else:
+    user_metric_seed_df = None
+
+if user_metric_seed_df is None:
+    metric_rows = []
+
+    for internal_name, report_name in [
+        ('UVCRec-MG-Attn', 'Backbone-only'),
+        ('SAVRec', 'SAVRec'),
+    ]:
+        for seed in SEEDS:
+            print(f'Validation user metrics: {report_name} seed={seed}')
+            model = load_main_model(internal_name, seed)
+            model.eval()
+
+            udf = evaluate_model_user_metrics(
+                model,
+                selection_val_df
+            )
+            udf['user_id'] = udf['user_id'].astype(str)
+            udf['model'] = report_name
+            udf['seed'] = int(seed)
+            metric_rows.append(udf)
+
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    user_metric_seed_df = pd.concat(metric_rows, ignore_index=True)
+    user_metric_seed_df.to_csv(PER_SEED_PATH, index=False)
+
+assert len(user_metric_seed_df) == 2 * len(SEEDS) * len(target_evidence)
+assert not user_metric_seed_df.duplicated(['model', 'seed', 'user_id']).any()
+
+metric_cols = ['HR@10', 'HR@20', 'NDCG@10', 'NDCG@20', 'MRR@20']
+
+user_model_mean = (
+    user_metric_seed_df
+    .groupby(['model', 'user_id'], as_index=False)[metric_cols]
+    .mean()
+)
+
+sav = (
+    user_model_mean[user_model_mean['model'] == 'SAVRec']
+    .drop(columns='model')
+    .rename(columns={m: f'SAVRec_{m}' for m in metric_cols})
+)
+
+back = (
+    user_model_mean[user_model_mean['model'] == 'Backbone-only']
+    .drop(columns='model')
+    .rename(columns={m: f'Backbone_{m}' for m in metric_cols})
+)
+
+per_user = target_evidence.merge(
+    sav,
+    on='user_id',
+    how='left',
+    validate='one_to_one'
+).merge(
+    back,
+    on='user_id',
+    how='left',
+    validate='one_to_one'
+)
+
+for m in metric_cols:
+    per_user[f'Delta_{m}'] = per_user[f'SAVRec_{m}'] - per_user[f'Backbone_{m}']
+
+assert per_user[[f'SAVRec_{m}' for m in metric_cols]].notna().all().all()
+assert per_user[[f'Backbone_{m}' for m in metric_cols]].notna().all().all()
+
+per_user.to_csv(PER_USER_PATH, index=False)
+
+# ------------------------------------------------------------------------------
+# 3. Evidence-stratified performance
+# ------------------------------------------------------------------------------
+stratified_rows = []
+
+strata = [
+    ('Popularity', 'popularity_group', 'train_popularity'),
+    ('Image availability', 'availability_group', 'visual_image_count'),
+    ('Visual coherence', 'coherence_group', 'visual_coherence'),
+]
+
+for feature_name, group_col, raw_col in strata:
+    for group_label, d in per_user.groupby(group_col, observed=True, sort=False):
+        row = {
+            'feature': feature_name,
+            'group': str(group_label),
+            'n_users': int(len(d)),
+            'evidence_raw_mean': float(d[raw_col].mean()),
+            'evidence_raw_min': float(d[raw_col].min()),
+            'evidence_raw_max': float(d[raw_col].max()),
+        }
+
+        for m in ['NDCG@20', 'HR@20', 'MRR@20']:
+            row[f'SAVRec_{m}'] = float(d[f'SAVRec_{m}'].mean())
+            row[f'Backbone_{m}'] = float(d[f'Backbone_{m}'].mean())
+            row[f'Delta_{m}'] = float(d[f'Delta_{m}'].mean())
+
+        stratified_rows.append(row)
+
+stratified_df = pd.DataFrame(stratified_rows)
+stratified_df.to_csv(STRATIFIED_PATH, index=False)
+
+print('\nEXPLORATORY VALIDATION — EVIDENCE-STRATIFIED PERFORMANCE')
+display(stratified_df)
+
+# ------------------------------------------------------------------------------
+# 4. Target-pair SAVRec evidence gate, averaged across seeds
+# ------------------------------------------------------------------------------
+def target_gate_for_eval(model, eval_df, batch_size=128):
+    model.eval()
+
+    tmp = eval_df[['user_id', 'img_hotel_id']].copy()
+    tmp['user_id'] = tmp['user_id'].astype(str)
+    tmp['img_hotel_id'] = tmp['img_hotel_id'].astype(str)
+
+    users_np = np.asarray(
+        [user2idx[u] for u in tmp['user_id']],
+        dtype=np.int64
+    )
+    items_np = np.asarray(
+        [item2idx[i] for i in tmp['img_hotel_id']],
+        dtype=np.int64
+    )
+
+    out = []
+
+    with torch.no_grad():
+        for start in range(0, len(tmp), batch_size):
+            end = min(start + batch_size, len(tmp))
+
+            users = torch.tensor(
+                users_np[start:end],
+                dtype=torch.long,
+                device=DEVICE
+            )
+
+            items = torch.tensor(
+                items_np[start:end],
+                dtype=torch.long,
+                device=DEVICE
+            ).unsqueeze(1)
+
+            result = model.pair_representation(
+                users,
+                items,
+                return_evidence_gate=True
+            )
+
+            gate = result[2]
+            assert tuple(gate.shape) == (end - start, 1)
+            out.append(gate[:, 0].detach().float().cpu().numpy())
+
+    values = np.concatenate(out)
+    assert len(values) == len(tmp)
+    assert np.isfinite(values).all()
+    assert (values >= 0.0).all() and (values <= 1.0).all()
+    return values
+
+if os.path.exists(GATE_USER_PATH):
+    gate_seed_df = pd.read_csv(GATE_USER_PATH)
+    cache_ok = (
+        set(gate_seed_df['seed'].astype(int)) == set(SEEDS)
+        and gate_seed_df['user_id'].astype(str).nunique() == len(target_evidence)
+        and len(gate_seed_df) == len(SEEDS) * len(target_evidence)
+    )
+    if not cache_ok:
+        print('Existing gate cache is incompatible; recomputing.')
+        gate_seed_df = None
+else:
+    gate_seed_df = None
+
+if gate_seed_df is None:
+    gate_rows = []
+
+    for seed in SEEDS:
+        print(f'Target-pair evidence gate: SAVRec seed={seed}')
+        model = load_main_model('SAVRec', seed)
+        gates = target_gate_for_eval(
+            model,
+            selection_val_df,
+            batch_size=128
+        )
+
+        gdf = selection_val_df[['user_id', 'img_hotel_id']].copy()
+        gdf['user_id'] = gdf['user_id'].astype(str)
+        gdf['img_hotel_id'] = gdf['img_hotel_id'].astype(str)
+        gdf['seed'] = int(seed)
+        gdf['evidence_gate'] = gates
+        gate_rows.append(gdf)
+
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    gate_seed_df = pd.concat(gate_rows, ignore_index=True)
+    gate_seed_df.to_csv(GATE_USER_PATH, index=False)
+
+gate_mean = (
+    gate_seed_df
+    .groupby('user_id', as_index=False)['evidence_gate']
+    .mean()
+    .rename(columns={'evidence_gate': 'evidence_gate_mean_3seed'})
+)
+
+gate_user = target_evidence.merge(
+    gate_mean,
+    on='user_id',
+    how='left',
+    validate='one_to_one'
+)
+assert gate_user['evidence_gate_mean_3seed'].notna().all()
+
+gate_strat_rows = []
+
+for feature_name, group_col, raw_col in strata:
+    for group_label, d in gate_user.groupby(group_col, observed=True, sort=False):
+        gate_strat_rows.append({
+            'feature': feature_name,
+            'group': str(group_label),
+            'n_users': int(len(d)),
+            'evidence_raw_mean': float(d[raw_col].mean()),
+            'gate_mean': float(d['evidence_gate_mean_3seed'].mean()),
+            'gate_sd_across_users': float(d['evidence_gate_mean_3seed'].std(ddof=1)),
+        })
+
+gate_stratified_df = pd.DataFrame(gate_strat_rows)
+gate_stratified_df.to_csv(GATE_STRATIFIED_PATH, index=False)
+
+print('\nEXPLORATORY VALIDATION — TARGET GATE BY EVIDENCE STRATUM')
+display(gate_stratified_df)
+
+# ------------------------------------------------------------------------------
+# 5. Complexity / parameter-overhead analysis
+# ------------------------------------------------------------------------------
+backbone_model = load_main_model('UVCRec-MG-Attn', SEEDS[0])
+savrec_model = load_main_model('SAVRec', SEEDS[0])
+
+def count_trainable_params(model):
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+def count_all_params(model):
+    return int(sum(p.numel() for p in model.parameters()))
+
+backbone_trainable = count_trainable_params(backbone_model)
+savrec_trainable = count_trainable_params(savrec_model)
+added_trainable = savrec_trainable - backbone_trainable
+
+evidence_encoder_params = int(
+    sum(p.numel() for p in savrec_model.evidence_encoder.parameters())
+)
+evidence_gate_params = int(
+    sum(p.numel() for p in savrec_model.evidence_visual_gate.parameters())
+)
+
+complexity_df = pd.DataFrame([
+    {
+        'model': 'Backbone-only',
+        'all_parameters': count_all_params(backbone_model),
+        'trainable_parameters': backbone_trainable,
+        'added_vs_backbone': 0,
+        'relative_parameter_overhead_pct': 0.0,
+        'evidence_encoder_parameters': 0,
+        'evidence_visual_gate_parameters': 0,
+    },
+    {
+        'model': 'SAVRec',
+        'all_parameters': count_all_params(savrec_model),
+        'trainable_parameters': savrec_trainable,
+        'added_vs_backbone': added_trainable,
+        'relative_parameter_overhead_pct': (
+            100.0 * added_trainable / backbone_trainable
+        ),
+        'evidence_encoder_parameters': evidence_encoder_params,
+        'evidence_visual_gate_parameters': evidence_gate_params,
+    },
+])
+
+complexity_df.to_csv(COMPLEXITY_PATH, index=False)
+
+print('\nPARAMETER OVERHEAD')
+display(complexity_df)
+
+assert added_trainable > 0
+assert added_trainable == evidence_encoder_params + evidence_gate_params, (
+    added_trainable,
+    evidence_encoder_params,
+    evidence_gate_params
+)
+
+del backbone_model, savrec_model
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+# ------------------------------------------------------------------------------
+# 6. Figures — validation-only exploratory analyses
+# ------------------------------------------------------------------------------
+order = ['Q1-low', 'Q2', 'Q3', 'Q4-high']
+
+pop_df = (
+    stratified_df[stratified_df['feature'] == 'Popularity']
+    .set_index('group')
+    .reindex(order)
+    .dropna(how='all')
+    .reset_index()
+)
+
+plt.figure(figsize=(7.2, 4.8))
+plt.plot(pop_df['group'], pop_df['SAVRec_NDCG@20'], marker='o', label='SAVRec')
+plt.plot(pop_df['group'], pop_df['Backbone_NDCG@20'], marker='o', label='Backbone-only')
+plt.xlabel('Target-hotel training popularity stratum')
+plt.ylabel('Validation NDCG@20')
+plt.legend()
+plt.tight_layout()
+POP_FIG = os.path.join(
+    FIGURE_DIR, 'exploratory_validation_popularity_stratified_ndcg20_v1.png'
+)
+plt.savefig(POP_FIG, dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+plt.figure(figsize=(7.2, 4.8))
+plt.plot(pop_df['group'], pop_df['Delta_NDCG@20'], marker='o')
+plt.axhline(0.0, linewidth=1)
+plt.xlabel('Target-hotel training popularity stratum')
+plt.ylabel('SAVRec − Backbone NDCG@20')
+plt.tight_layout()
+DELTA_FIG = os.path.join(
+    FIGURE_DIR, 'exploratory_validation_popularity_gain_v1.png'
+)
+plt.savefig(DELTA_FIG, dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+plt.figure(figsize=(7.2, 4.8))
+for feature_name in ['Popularity', 'Image availability', 'Visual coherence']:
+    d = (
+        gate_stratified_df[gate_stratified_df['feature'] == feature_name]
+        .set_index('group')
+        .reindex(order)
+        .dropna(how='all')
+        .reset_index()
+    )
+    plt.plot(d['group'], d['gate_mean'], marker='o', label=feature_name)
+
+plt.xlabel('Evidence stratum (low → high)')
+plt.ylabel('Mean SAVRec evidence gate')
+plt.legend()
+plt.tight_layout()
+GATE_FIG = os.path.join(
+    FIGURE_DIR, 'exploratory_validation_gate_by_evidence_strata_v1.png'
+)
+plt.savefig(GATE_FIG, dpi=300, bbox_inches='tight')
+plt.show()
+plt.close()
+
+# ------------------------------------------------------------------------------
+# 7. Manifest
+# ------------------------------------------------------------------------------
+manifest = {
+    'version': CELL39_VERSION,
+    'analysis_type': 'exploratory_post_hoc',
+    'split_used_for_new_analysis': 'validation_only',
+    'test_metrics_recomputed': False,
+    'model_retraining': False,
+    'checkpoint_modification': False,
+    'model_seeds': [int(x) for x in SEEDS],
+    'outputs': {
+        'per_seed_user_metrics': PER_SEED_PATH,
+        'per_user_effects': PER_USER_PATH,
+        'stratified_performance': STRATIFIED_PATH,
+        'target_gate_per_user': GATE_USER_PATH,
+        'gate_stratified': GATE_STRATIFIED_PATH,
+        'parameter_overhead': COMPLEXITY_PATH,
+        'popularity_ndcg_figure': POP_FIG,
+        'popularity_gain_figure': DELTA_FIG,
+        'gate_strata_figure': GATE_FIG,
+    }
+}
+
+with open(MANIFEST_PATH, 'w') as f:
+    json.dump(manifest, f, indent=2)
+
+print('\nSaved:')
+for p in [
+    PER_SEED_PATH,
+    PER_USER_PATH,
+    STRATIFIED_PATH,
+    GATE_USER_PATH,
+    GATE_STRATIFIED_PATH,
+    COMPLEXITY_PATH,
+    POP_FIG,
+    DELTA_FIG,
+    GATE_FIG,
+    MANIFEST_PATH,
+]:
+    print('  ', p)
+
+print('\n✅ Cell 39 complete.')
+print('✅ No model trained or modified.')
+print('✅ New subgroup/mechanism analyses used validation only.')
+print('✅ Treat these analyses as exploratory/post-hoc in the paper.')
+print('=' * 100)
