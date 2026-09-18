@@ -1,12 +1,25 @@
+# %% [markdown]
+# # SAVRec — Data Preparation and Frozen Artifact Construction
+# 
+# This notebook documents the data pipeline used to create the model-independent
+# artifacts consumed by `02_SAVRec_Final_Experiment.ipynb`.
+# 
+# **Artifact provenance:** the frozen catalog/split used by the final experiment is constructed from the
+# `visual_coverage_v3.csv` manifest created by the ResNet-50 visual-coverage stage.
+# That manifest must be used when reconstructing the V6 split.
+# 
+# For exact reproduction of the reported paper numbers, use the frozen split,
+# mapping, SBERT, and CLIP artifacts listed in `data/README.md`. Hotel image URLs
+# are external and can change over time. The CLIP reconstruction stage below uses
+# the same CLIP ViT-B/32 encoder and preprocessing as the paper pipeline and
+# targets the frozen final catalog directly.
 
-# %% PUBLIC NOTEBOOK CELL 1
+# %%
 # ==============================================================================
 # CELL 1: SETUP, GOOGLE DRIVE MOUNT & KAGGLE AUTHENTICATION
 # ==============================================================================
 import os
 import glob
-import shutil
-import subprocess
 import pandas as pd
 import numpy as np
 import pyarrow as pa
@@ -31,14 +44,14 @@ PARQUET_FILE = os.path.join(DRIVE_PATH, 'merged_hotelrec.parquet')
 if not os.path.exists('/root/.kaggle/kaggle.json'):
     print("📤 Please upload your 'kaggle.json' API token file:")
     uploaded = files.upload()
-    os.makedirs(os.path.expanduser('~/.kaggle'), exist_ok=True)
-    shutil.move('kaggle.json', os.path.expanduser('~/.kaggle/kaggle.json'))
-    os.chmod(os.path.expanduser('~/.kaggle/kaggle.json'), 0o600)
-    print("✅ Kaggle token configured successfully!")
+    !mkdir -p ~/.kaggle
+    !mv kaggle.json ~/.kaggle/
+    !chmod 600 ~/.kaggle/kaggle.json
+    print("Kaggle token configured successfully!")
 else:
-    print("✅ Kaggle API token already configured.")
+    print("Kaggle API token already configured.")
 
-# %% PUBLIC NOTEBOOK CELL 2
+# %%
 # ==============================================================================
 # CELL 2: ZERO-RAM KAGGLE CHUNK PARSER & COMPILER
 # ==============================================================================
@@ -50,17 +63,11 @@ file_paths = [f for f in file_paths if 'temp_merged' not in f and 'hotel_info' n
 
 if len(file_paths) == 0 and not os.path.exists(PARQUET_FILE):
     print("📥 Downloading HotelRec splits from Kaggle...")
-    os.makedirs('./dataset/hotelrec', exist_ok=True)
-    for dataset_name in [
-        'hariwh0/hotelrec-dataset-1',
-        'hariwh0/hotelrec-dataset-2',
-        'hariwh0/hotelrec-dataset-3',
-        'hariwh0/hotelrec-dataset-4',
-    ]:
-        subprocess.run(
-            ['kaggle', 'datasets', 'download', '-d', dataset_name, '-p', './dataset/hotelrec', '--unzip'],
-            check=True,
-        )
+    !mkdir -p ./dataset/hotelrec
+    !kaggle datasets download -d hariwh0/hotelrec-dataset-1 -p ./dataset/hotelrec --unzip
+    !kaggle datasets download -d hariwh0/hotelrec-dataset-2 -p ./dataset/hotelrec --unzip
+    !kaggle datasets download -d hariwh0/hotelrec-dataset-3 -p ./dataset/hotelrec --unzip
+    !kaggle datasets download -d hariwh0/hotelrec-dataset-4 -p ./dataset/hotelrec --unzip
     file_paths = sorted(glob.glob('./dataset/hotelrec/**/*.*', recursive=True))
 
 # 2. Stream-compile to disk if master parquet doesn't exist yet
@@ -106,13 +113,13 @@ if not os.path.exists(PARQUET_FILE):
     if writer:
         writer.close()
         print(f"\n🎉 Successfully compiled {total_rows:,} rows! Copying to Drive...")
-        shutil.copy2(LOCAL_PARQUET, PARQUET_FILE)
-        os.remove(LOCAL_PARQUET)
-        print(f"✅ Master dataset saved at: {PARQUET_FILE}")
+        !cp "{LOCAL_PARQUET}" "{PARQUET_FILE}"
+        !rm "{LOCAL_PARQUET}"
+        print(f"Master dataset saved at: {PARQUET_FILE}")
 else:
-    print(f"✅ Master dataset already exists in Drive: {PARQUET_FILE}")
+    print(f"Master dataset already exists in Drive: {PARQUET_FILE}")
 
-# %% PUBLIC NOTEBOOK CELL 3
+# %%
 # ==============================================================================
 # CELL 3 (v3 FIXED): STRICT 1:1 PROPERTY ALIGNMENT WITH CORRECT HEADERS
 # ==============================================================================
@@ -258,7 +265,13 @@ print(f"\nSaved successfully to Drive!")
 del df, img_df, h50k
 gc.collect()
 
-# %% PUBLIC NOTEBOOK CELL 5
+# %% [markdown]
+# ## Intermediate v3 positive split for historical visual coverage
+# 
+# This is not the final evaluation split. It is retained because the historical
+# visual-coverage extractor restricted processing to hotels appearing in v3 train.
+
+# %%
 # ==============================================================================
 # CELL 5 (v3): HYBRID STRATIFIED SPLITTER (OPTIMIZED FOR SPARSE USERS)
 # ==============================================================================
@@ -335,9 +348,15 @@ train_df.to_parquet(os.path.join(DRIVE_PATH, 'train_v3.parquet'), index=False)
 val_df.to_parquet(os.path.join(DRIVE_PATH, 'val_v3.parquet'), index=False)
 test_df.to_parquet(os.path.join(DRIVE_PATH, 'test_v3.parquet'), index=False)
 
-print(f"\n✅ All v3 splits saved successfully to Drive!")
+print(f"\nAll v3 splits saved successfully to Drive!")
 
-# %% PUBLIC NOTEBOOK CELL 7
+# %% [markdown]
+# ## Historical ResNet visual-coverage manifest
+# 
+# This stage creates `visual_coverage_v3.csv`, the exact manifest name consumed by
+# the final V6 splitter below.
+
+# %%
 # ==============================================================================
 # CELL 6 (v3): THREADED RESNET-50 VISUAL FEATURE EXTRACTOR
 #
@@ -548,7 +567,14 @@ del feature_extractor, resnet
 torch.cuda.empty_cache()
 gc.collect()
 
-# %% PUBLIC NOTEBOOK CELL 9
+# %% [markdown]
+# ## Frozen leak-free benchmark split
+# 
+# This is the frozen split consumed by the final SAVRec experiment. The `v6`
+# filename suffix is retained for artifact provenance. Repeated user–hotel reviews are
+# aggregated before splitting, so the same pair cannot cross train/validation/test.
+
+# %%
 # ==============================================================================
 # CELL 7 (v6): CLEAN LEAK-FREE SPLIT
 #
@@ -871,7 +897,7 @@ print(
 )
 
 print(
-    "✅ Exactly one row per user-hotel pair."
+    "Exactly one row per user-hotel pair."
 )
 
 
@@ -1274,7 +1300,7 @@ assert val_test_overlap == 0
 
 
 print(
-    "✅ ZERO duplicate / cross-split user-hotel overlap."
+    "ZERO duplicate / cross-split user-hotel overlap."
 )
 
 
@@ -1335,7 +1361,7 @@ for name, split_df in [
 
 
 print(
-    "✅ Warm-start verified."
+    "Warm-start verified."
 )
 
 
@@ -1717,33 +1743,42 @@ print(
 print("=" * 85)
 
 print(
-    "✅ V6 COMPLETE — CLEAN USER-HOTEL SPLIT"
+    "V6 COMPLETE — CLEAN USER-HOTEL SPLIT"
 )
 
 print(
-    "✅ One unique user-hotel interaction before splitting"
+    "One unique user-hotel interaction before splitting"
 )
 
 print(
-    "✅ Zero duplicate pairs"
+    "Zero duplicate pairs"
 )
 
 print(
-    "✅ Zero cross-split user-hotel overlap"
+    "Zero cross-split user-hotel overlap"
 )
 
 print(
-    "✅ Warm-start verified"
+    "Warm-start verified"
 )
 
 print(
-    "✅ V6 maps/catalog/history/negatives saved"
+    "V6 maps/catalog/history/negatives saved"
 )
 
 print("=" * 85)
 
-# %% PUBLIC NOTEBOOK CELL 11
-# %% PUBLIC NOTEBOOK CELL 12
+# %% [markdown]
+# ## CLIP ViT-B/32 per-image features for the frozen final catalog
+# 
+# After the frozen final catalog has been fixed, this stage extracts per-image
+# 512-dimensional CLIP ViT-B/32 embeddings for exactly those catalog hotels.
+# 
+# The paper run uses the frozen `clip_per_image_v4.pt` artifact. A fresh download
+# can differ if external hotel-image URLs have disappeared or changed, so the
+# frozen artifact is preferred for exact numerical reproduction.
+
+# %%
 # ==============================================================================
 # CLIP ViT-B/32 PER-IMAGE FEATURE EXTRACTION FOR THE FINAL V6 CATALOG
 # ==============================================================================
@@ -1939,7 +1974,7 @@ if failure_counts:
         [{'reason': k, 'count': int(v)} for k, v in sorted(failure_counts.items())]
     ).to_csv(CLIP_FAILURE_FILE, index=False)
 
-# The reported V7 benchmark contains at least one valid image for every final item.
+# The reported benchmark contains at least one valid image for every final item.
 missing_clip = sorted(catalog_ids - set(clip_per_image))
 if missing_clip:
     raise RuntimeError(
@@ -1967,8 +2002,10 @@ gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
+# %% [markdown]
+# ## V6 artifact and visual-coverage audit
 
-# %% PUBLIC NOTEBOOK CELL 13
+# %%
 # ==============================================================================
 # CELL 8 (v6): LOAD V6 DATA + VERIFY VISUAL FEATURE COVERAGE
 # ==============================================================================
@@ -2064,7 +2101,7 @@ for path in required_files:
             f"Required file is missing:\n{path}"
         )
 
-print("✅ All required V6/data files found.")
+print("All required V6/data files found.")
 
 
 # ==============================================================================
@@ -2288,7 +2325,7 @@ if len(missing_visual) > 0:
 
 
 print(
-    "✅ Every V6 catalog hotel has cached CLIP image embeddings."
+    "Every V6 catalog hotel has cached CLIP image embeddings."
 )
 
 
@@ -2394,7 +2431,7 @@ print(
 print("=" * 85)
 
 print(
-    "✅ CELL 8 (v6) COMPLETE"
+    "CELL 8 (v6) COMPLETE"
 )
 
 print(
@@ -2403,7 +2440,13 @@ print(
 
 print("=" * 85)
 
-# %% PUBLIC NOTEBOOK CELL 15
+# %% [markdown]
+# ## Final train-only text feature construction
+# 
+# SBERT item features are constructed only from review text belonging to the frozen
+# training user–hotel pairs and aligned to the final catalog.
+
+# %%
 # ==============================================================================
 # CELL 9 (v6): LEAK-FREE ITEM TEXT FEATURES
 #                     SBERT (384-d) + CLIP-text (512-d) + TF-IDF/SVD (384-d)
@@ -2557,7 +2600,7 @@ for path in required_inputs:
         )
 
 print(
-    "✅ All V6 text-feature input files found."
+    "All V6 text-feature input files found."
 )
 
 
@@ -2582,7 +2625,7 @@ if 'review_text' not in schema:
     )
 
 print(
-    "✅ review_text available."
+    "review_text available."
 )
 
 
@@ -2798,7 +2841,7 @@ assert train_test_overlap == 0
 assert val_test_overlap == 0
 
 print(
-    "✅ V6 split is clean."
+    "V6 split is clean."
 )
 
 
@@ -3059,7 +3102,7 @@ if missing_text:
 
 
 print(
-    "✅ Every V6 catalog hotel has training-only text."
+    "Every V6 catalog hotel has training-only text."
 )
 
 
@@ -3262,7 +3305,7 @@ if missing_sbert:
     )
 
 print(
-    "    ✅ SBERT coverage complete."
+    "    SBERT coverage complete."
 )
 
 
@@ -3460,7 +3503,7 @@ if missing_clip_text:
     )
 
 print(
-    "    ✅ CLIP-text coverage complete."
+    "    CLIP-text coverage complete."
 )
 
 
@@ -3615,7 +3658,7 @@ if missing_tfidf:
     )
 
 print(
-    "    ✅ TF-IDF/SVD coverage complete."
+    "    TF-IDF/SVD coverage complete."
 )
 
 
