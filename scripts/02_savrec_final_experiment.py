@@ -1,5 +1,5 @@
 
-# %% PUBLIC NOTEBOOK CELL 1
+# %%
 # ==============================================================================
 # CELL 1 — JOURNAL-REPRODUCIBLE SETUP
 # ==============================================================================
@@ -119,7 +119,7 @@ if torch.cuda.is_available():
 print('='*100)
 
 
-# %% PUBLIC NOTEBOOK CELL 2
+# %%
 # ==============================================================================
 # CELL 2 — LOAD RAW V6 ARTIFACTS + BUILD CLEAN JOURNAL BENCHMARK VIEW
 # ==============================================================================
@@ -289,7 +289,7 @@ for name, df_ in [('train_df', train_df), ('val_df', val_df), ('test_df', test_d
     dup = int(df_.duplicated(['user_id', 'img_hotel_id']).sum())
     assert dup == 0, f'{name} contains {dup} duplicate user-hotel interactions'
 
-print('✅ Cleaned V7 split integrity passed.')
+print('Cleaned V7 split integrity passed.')
 
 # ------------------------------------------------------------------------------
 # Build train graph
@@ -502,7 +502,7 @@ for idx in audit_indices:
             f'CLIP mapping mismatch: item index {idx}, hotel ID {iid}'
         )
 
-print('✅ Raw SBERT/CLIP hotel-ID → item-index alignment audit passed.')
+print('Raw SBERT/CLIP hotel-ID → item-index alignment audit passed.')
 
 # ------------------------------------------------------------------------------
 # Canonical immutable copies used by later analyses
@@ -536,7 +536,7 @@ torch.cuda.empty_cache()
 
 
 
-# %% PUBLIC NOTEBOOK CELL 3
+# %%
 # ==============================================================================
 # CELL 3 — STRICT DATA / CATALOG / LEAKAGE / FEATURE AUDIT
 # ==============================================================================
@@ -555,7 +555,7 @@ for name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
 assert '/undefined' not in {u.lower() for u in user2idx.keys()}
 
 print(
-    '✅ Invalid/anonymous users removed before user mapping, graph, evidence, '
+    'Invalid/anonymous users removed before user mapping, graph, evidence, '
     'and evaluation state.'
 )
 
@@ -591,7 +591,7 @@ if catalog_ids != mapped_ids:
         f'map-only={sorted(mapped_ids - catalog_ids)[:10]}'
     )
 
-print('✅ catalog_df and item2idx contain exactly the same 3,322 hotels.')
+print('catalog_df and item2idx contain exactly the same 3,322 hotels.')
 
 # ------------------------------------------------------------------------------
 # 3. Split mapping coverage
@@ -695,11 +695,11 @@ with open(os.path.join(ARTIFACT_DIR, 'canonical_benchmark_summary.json'), 'w') a
     json.dump(summary, f, indent=2)
 
 print(json.dumps(summary, indent=2))
-print('✅ Strict canonical benchmark audit passed.')
+print('Strict canonical benchmark audit passed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 4
+# %%
 # ==============================================================================
 # EVIDENCE-AWARE FEATURE CONSTRUCTION
 # ==============================================================================
@@ -1425,7 +1425,7 @@ assert len(val_df) == val_df["user_id"].astype(str).nunique()
 assert len(test_df) == test_df["user_id"].astype(str).nunique()
 
 print(
-    f"✅ Clean evidence alignment passed: "
+    f"Clean evidence alignment passed: "
     f"val={len(val_evidence_df):,} rows / "
     f"{val_evidence_df['user_id'].astype(str).nunique():,} users; "
     f"test={len(test_evidence_df):,} rows / "
@@ -1781,7 +1781,7 @@ item_feature_df.to_csv(
 
 print("\n")
 print("=" * 100)
-print("✅ CELL 19 COMPLETE")
+print("CELL 19 COMPLETE")
 print("=" * 100)
 
 print(
@@ -1833,12 +1833,12 @@ assert torch.isfinite(USER_EVIDENCE).all()
 assert torch.isfinite(ITEM_EVIDENCE).all()
 assert 0.0 <= float(USER_EVIDENCE.min()) <= float(USER_EVIDENCE.max()) <= 1.0
 assert 0.0 <= float(ITEM_EVIDENCE.min()) <= float(ITEM_EVIDENCE.max()) <= 1.0
-print("✅ All normalized evidence features are finite and within [0, 1].")
+print("All normalized evidence features are finite and within [0, 1].")
 print("=" * 100)
 
 
 
-# %% PUBLIC NOTEBOOK CELL 5
+# %%
 # ==============================================================================
 # CELL 5 — CANONICAL USER-LEVEL, MULTI-POSITIVE FULL-CATALOG EVALUATION
 # ==============================================================================
@@ -2027,11 +2027,11 @@ def summarize_three_seed_runs(runs):
     return out
 
 
-print('✅ Canonical user-level multi-positive full-catalog evaluator ready.')
+print('Canonical user-level multi-positive full-catalog evaluator ready.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 6
+# %%
 # ==============================================================================
 # CELL 6 — USER-LEVEL EVALUATION HELPERS + MOST-POPULAR BASELINE
 # ==============================================================================
@@ -2090,11 +2090,11 @@ def evaluate_popularity_v6(eval_df):
     }
 
 
-print('✅ User-level evaluation helpers ready.')
+print('User-level evaluation helpers ready.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 7
+# %%
 # ==============================================================================
 # CELL 7 — ID/TEXT BASELINES
 # ==============================================================================
@@ -2324,11 +2324,11 @@ class TextOnly(
             ).T
         )
 
-print('✅ TextOnly definition loaded.')
+print('TextOnly definition loaded.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 8
+# %%
 # ==============================================================================
 # CELL 8 — VBPR / MMGCN / BM3 DEFINITIONS
 # ==============================================================================
@@ -3079,11 +3079,11 @@ class BM3(nn.Module):
 
         return loss
 
-print('✅ VBPR / MMGCN / BM3 definitions loaded.')
+print('VBPR / MMGCN / BM3 definitions loaded.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 9
+# %%
 # ==============================================================================
 # CELL 9 — UVCRec-MG-Attn (STRONG MULTIMODAL BASELINE)
 # ==============================================================================
@@ -4480,14 +4480,14 @@ class UVCRecMGAttn(
             dim=1
         )
 
-print('✅ UVCRecMGAttn definition loaded.')
+print('UVCRecMGAttn definition loaded.')
 
-print('✅ UVCRec-MG-Attn definition loaded.')
-
-
+print('UVCRec-MG-Attn definition loaded.')
 
 
-# %% PUBLIC NOTEBOOK CELL 10
+
+
+# %%
 # ==============================================================================
 # CELL 10 — SAVRec: EVIDENCE-AWARE VISUAL RECOMMENDATION
 # ==============================================================================
@@ -6408,10 +6408,10 @@ class SAVRec(nn.Module):
 
 
 
-print('✅ SAVRec definition loaded.')
+print('SAVRec definition loaded.')
 
 
-# %% PUBLIC NOTEBOOK CELL 11
+# %%
 # ==============================================================================
 # CELL 11 — COMMON TRAINING / CHECKPOINT FRAMEWORK
 # ==============================================================================
@@ -6793,11 +6793,11 @@ def train_bm3_seed(seed, weight_decay, batch_size=TRAIN_BATCH_SIZE):
     return meta
 
 
-print('✅ Common training framework ready.')
+print('Common training framework ready.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 12
+# %%
 # ==============================================================================
 # CELL 12 — FINAL MODEL REGISTRY + PRE-TRAINING CONSISTENCY TESTS
 # ==============================================================================
@@ -6911,7 +6911,7 @@ assert not hasattr(_uvc, 'image_value')
 assert not hasattr(_sav, 'image_key')
 assert not hasattr(_sav, 'image_value')
 
-print('✅ UVCRec/SAVRec item-fusion dimensions match; SAVRec adds explicit evidence modules.')
+print('UVCRec/SAVRec item-fusion dimensions match; SAVRec adds explicit evidence modules.')
 
 del _uvc, _sav
 gc.collect()
@@ -6938,7 +6938,7 @@ for metric, value in probe_metrics.items():
     assert 0.0 <= value <= 1.0, (metric, value)
 
 print('Evaluator smoke-test metrics:', probe_metrics)
-print('✅ All pre-training model/evaluator consistency tests passed.')
+print('All pre-training model/evaluator consistency tests passed.')
 print('=' * 100)
 
 del _probe_model
@@ -6946,7 +6946,7 @@ gc.collect()
 torch.cuda.empty_cache()
 
 
-# %% PUBLIC NOTEBOOK CELL 14
+# %%
 # ==============================================================================
 # CELL 13 — FINAL MAIN-TRAINING PREFLIGHT + VALIDATION MOST-POPULAR
 # ==============================================================================
@@ -7091,10 +7091,10 @@ for metric, value in MOST_POPULAR_VAL.items():
     print(f'  {metric:<10}: {value:.6f}')
 print(f'\nProtocol JSON   : {protocol_path}')
 print(f'Most-Popular JSON: {most_popular_path}')
-print('\n✅ Main-training preflight passed. No test metric was computed.')
+print('\nMain-training preflight passed. No test metric was computed.')
 print('=' * 100)
 
-# %% PUBLIC NOTEBOOK CELL 15
+# %%
 # ==============================================================================
 # CELL 14 — TRAIN LIGHTGCN — SEEDS 42 / 1 / 7
 # ==============================================================================
@@ -7127,9 +7127,9 @@ for r in LIGHTGCN_RUNS:
         f"  seed={r['seed']} | epoch={r['best_epoch']} | "
         f"NDCG@20={r['best_validation_ndcg20']:.6f}"
     )
-print('✅ LightGCN complete.')
+print('LightGCN complete.')
 
-# %% PUBLIC NOTEBOOK CELL 16
+# %%
 # ==============================================================================
 # CELL 15 — TRAIN TEXT-ONLY — SEEDS 42 / 1 / 7
 # ==============================================================================
@@ -7162,9 +7162,9 @@ for r in TEXT_ONLY_RUNS:
         f"  seed={r['seed']} | epoch={r['best_epoch']} | "
         f"NDCG@20={r['best_validation_ndcg20']:.6f}"
     )
-print('✅ Text-Only complete.')
+print('Text-Only complete.')
 
-# %% PUBLIC NOTEBOOK CELL 17
+# %%
 # ==============================================================================
 # CELL 16 — TRAIN VBPR — SEEDS 42 / 1 / 7
 # ==============================================================================
@@ -7197,9 +7197,9 @@ for r in VBPR_RUNS:
         f"  seed={r['seed']} | epoch={r['best_epoch']} | "
         f"NDCG@20={r['best_validation_ndcg20']:.6f}"
     )
-print('✅ VBPR complete.')
+print('VBPR complete.')
 
-# %% PUBLIC NOTEBOOK CELL 18
+# %%
 # ==============================================================================
 # CELL 19 — TRAIN UVCREC-MG-ATTN — SEEDS 42 / 1 / 7
 # ==============================================================================
@@ -7235,9 +7235,9 @@ for r in UVCREC_RUNS:
         f"  seed={r['seed']} | epoch={r['best_epoch']} | "
         f"NDCG@20={r['best_validation_ndcg20']:.6f}"
     )
-print('✅ UVCRec-MG-Attn complete.')
+print('UVCRec-MG-Attn complete.')
 
-# %% PUBLIC NOTEBOOK CELL 19
+# %%
 # ==============================================================================
 # CELL 20 — TRAIN SAVREC — SEEDS 42 / 1 / 7
 # ==============================================================================
@@ -7274,9 +7274,9 @@ for r in SAVREC_RUNS:
         f"  seed={r['seed']} | epoch={r['best_epoch']} | "
         f"NDCG@20={r['best_validation_ndcg20']:.6f}"
     )
-print('✅ SAVRec complete.')
+print('SAVRec complete.')
 
-# %% PUBLIC NOTEBOOK CELL 20
+# %%
 # ==============================================================================
 # CELL 21 — MAIN TRAINING SUMMARY + CHECKPOINT / METADATA AUDIT
 # ==============================================================================
@@ -7509,13 +7509,13 @@ print('  ', summary_path)
 print('  ', ranking_path)
 print('  ', manifest_path)
 
-print('\n✅ All 15 final-main-model checkpoints (5 models × 3 seeds) exist,')
+print('\nAll 15 final-main-model checkpoints (5 models × 3 seeds) exist,')
 print('   match the frozen architectures, and were selected using validation only.')
-print('✅ No test metric was computed in Cells 13–21.')
+print('No test metric was computed in Cells 13–21.')
 print('=' * 100)
 
 
-# %% PUBLIC NOTEBOOK CELL 22
+# %%
 # ==============================================================================
 # CELL 22 — REFERENCE-FAITHFUL BASELINES — FIXED DEFINITIONS + SEARCH SPACE
 # ==============================================================================
@@ -8125,14 +8125,14 @@ def make_reference_model(model_name, config):
         return SMOREReference(config)
     raise KeyError(model_name)
 
-print('✅ Fixed reference model definitions loaded.')
-print('✅ SMORE cl_loss corrected to 0.01.')
-print('✅ Hyperparameter search spaces declared before any test evaluation.')
-print('✅ No test metric was computed.')
+print('Fixed reference model definitions loaded.')
+print('SMORE cl_loss corrected to 0.01.')
+print('Hyperparameter search spaces declared before any test evaluation.')
+print('No test metric was computed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 23
+# %%
 # ==============================================================================
 # CELL 23 — REFERENCE BASELINE PRE-TUNING AUDIT
 # ==============================================================================
@@ -8220,13 +8220,13 @@ with open(protocol_path_v2, 'w') as f:
     )
 
 print('Protocol:', protocol_path_v2)
-print('✅ Pre-tuning audit passed.')
-print('✅ Tuning seed 2026 is separate from final seeds [42,1,7].')
-print('✅ No test metric was computed.')
+print('Pre-tuning audit passed.')
+print('Tuning seed 2026 is separate from final seeds [42,1,7].')
+print('No test metric was computed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 24
+# %%
 # ==============================================================================
 # CELL 24 — VALIDATION-ONLY TUNING + FINAL-TRAINING FRAMEWORK
 # ==============================================================================
@@ -8564,17 +8564,17 @@ def train_reference_final_seed(model_name, cfg, seed):
         torch.cuda.empty_cache()
     return meta
 
-print('✅ Tuning/final-training framework ready.')
-print('✅ Tuning-trial and final-seed caches enabled.')
+print('Tuning/final-training framework ready.')
+print('Tuning-trial and final-seed caches enabled.')
 print(
-    f'✅ Reference training budget: batch={REFERENCE_BATCH_SIZE}, '
+    f'Reference training budget: batch={REFERENCE_BATCH_SIZE}, '
     f'max_epochs={REFERENCE_MAX_EPOCHS}, patience={REFERENCE_PATIENCE}.'
 )
-print('✅ Test split remains unused.')
+print('Test split remains unused.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 25
+# %%
 # ==============================================================================
 # CELL 25 — TUNE MMGCN-REF — OFFICIAL-RANGE COORDINATE SEARCH
 # ==============================================================================
@@ -8625,11 +8625,11 @@ print(json.dumps(MMGCN_SELECTED_CONFIG, indent=2))
 print(f'Best tuning NDCG@20: {MMGCN_TUNING_BEST["best_validation_ndcg20"]:.6f}')
 print('Tuning CSV:', mmgcn_tuning_path)
 print('Selected JSON:', mmgcn_sel_path)
-print('✅ MMGCN tuning complete. No test metric computed.')
+print('MMGCN tuning complete. No test metric computed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 26
+# %%
 # ==============================================================================
 # CELL 26 — TUNE BM3-REF — FULL RELEASED CARTESIAN GRID
 # ==============================================================================
@@ -8667,11 +8667,11 @@ print(json.dumps(BM3_SELECTED_CONFIG, indent=2))
 print(f'Best tuning NDCG@20: {BM3_TUNING_BEST["best_validation_ndcg20"]:.6f}')
 print('Tuning CSV:', bm3_tuning_path)
 print('Selected JSON:', bm3_sel_path)
-print('✅ BM3 tuning complete. No test metric computed.')
+print('BM3 tuning complete. No test metric computed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 27
+# %%
 # ==============================================================================
 # CELL 27 — TUNE SMORE — CORRECT cl_loss + DETERMINISTIC OFFICIAL-VALUE COORDINATE SEARCH
 # ==============================================================================
@@ -8758,11 +8758,11 @@ print(json.dumps(SMORE_SELECTED_CONFIG, indent=2))
 print(f'Best tuning NDCG@20: {SMORE_TUNING_BEST["best_validation_ndcg20"]:.6f}')
 print('Tuning CSV:', smore_tuning_path)
 print('Selected JSON:', smore_sel_path)
-print('✅ SMORE tuning complete with cl_loss=0.01. No test metric computed.')
+print('SMORE tuning complete with cl_loss=0.01. No test metric computed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 28
+# %%
 # ==============================================================================
 # CELL 28 — LOCK CONFIGS + FINAL THREE-SEED REFERENCE-BASELINE TRAINING
 # ==============================================================================
@@ -8835,13 +8835,13 @@ for model_name in ['MMGCN-Ref', 'BM3-Ref', 'SMORE']:
             f"NDCG@20={r['best_validation_ndcg20']:.6f}"
         )
 
-print('\n✅ Final reference baseline training complete.')
-print('✅ Hyperparameters were locked before seeds [42,1,7].')
-print('✅ No test metric was computed.')
+print('\nFinal reference baseline training complete.')
+print('Hyperparameters were locked before seeds [42,1,7].')
+print('No test metric was computed.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 29
+# %%
 # ==============================================================================
 # CELL 29 — FINAL REFERENCE AUDIT + PAPER-STYLE VALIDATION TABLE
 # ==============================================================================
@@ -9024,13 +9024,13 @@ display(
 print('\nSaved:')
 for p in [per_seed_path, summary_path, manifest_path, paper_path, backbone_path]:
     print('  ', p)
-print('\n✅ All 9 tuned reference-baseline checkpoints passed architecture/metadata audit.')
-print('✅ Old compact MMGCN/BM3 are excluded from the paper-style table.')
-print('✅ SMORE cl_loss=0.01 is enforced in the selected configuration.')
-print('✅ No test metric was computed in Cells 22–29.')
+print('\nAll 9 tuned reference-baseline checkpoints passed architecture/metadata audit.')
+print('Old compact MMGCN/BM3 are excluded from the paper-style table.')
+print('SMORE cl_loss=0.01 is enforced in the selected configuration.')
+print('No test metric was computed in Cells 22–29.')
 print('=' * 100)
 
-# %% PUBLIC NOTEBOOK CELL 31
+# %%
 import os, gc, json, hashlib
 from datetime import datetime, timezone
 import numpy as np, pandas as pd, torch
@@ -9177,10 +9177,10 @@ with open(FREEZE30_PATH,'w') as f:
                'planned_significance_comparisons':[f'{a} vs {b}' for a,b in SIGNIFICANCE_COMPARISONS],
                'planned_significance_metrics':SIGNIFICANCE_METRICS,'bootstrap_resamples':BOOTSTRAP_RESAMPLES,
                'current_pipeline_test_used_for_selection':False,'historical_test_previously_inspected_in_prior_development':True},f,indent=2)
-print('✅ Preflight passed. No test metric computed.')
+print('Preflight passed. No test metric computed.')
 
 
-# %% PUBLIC NOTEBOOK CELL 32
+# %%
 print('='*100); print('CELL 31 — SAVREC EVIDENCE ABLATIONS'); print('='*100)
 
 def make_evidence_variant(v):
@@ -9236,10 +9236,10 @@ for v in ABLATION_VARIANTS:
     runs=[]
     for seed in SEEDS: runs.append(train_ablation_seed(v,seed))
     ABLATION_META[v]=runs
-print('✅ Cell 31 complete. No test metric computed.')
+print('Cell 31 complete. No test metric computed.')
 
 
-# %% PUBLIC NOTEBOOK CELL 33
+# %%
 print('='*100); print('CELL 32 — SHUFFLED-EVIDENCE CONTROL'); print('='*100)
 def make_shuffled_evidence(seed):
     gu=torch.Generator(device='cpu').manual_seed(SHUFFLE_USER_SEED_BASE+int(seed)); gi=torch.Generator(device='cpu').manual_seed(SHUFFLE_ITEM_SEED_BASE+int(seed))
@@ -9269,10 +9269,10 @@ ablation_val_summary_df=pd.DataFrame(s).sort_values('NDCG@20_mean',ascending=Fal
 ABLATION_VAL_PER_SEED_PATH=os.path.join(RESULT_DIR,'savrec_ablation_validation_per_seed_v3.csv')
 ABLATION_VAL_SUMMARY_PATH=os.path.join(RESULT_DIR,'savrec_ablation_validation_mean_sd_v3.csv')
 ablation_val_per_seed_df.to_csv(ABLATION_VAL_PER_SEED_PATH,index=False); ablation_val_summary_df.to_csv(ABLATION_VAL_SUMMARY_PATH,index=False)
-display(ablation_val_summary_df); print('✅ Cell 32 complete. No test metric computed.')
+display(ablation_val_summary_df); print('Cell 32 complete. No test metric computed.')
 
 
-# %% PUBLIC NOTEBOOK CELL 34
+# %%
 print('='*100); print('CELL 33 — SAVREC EVIDENCE-GATE ANALYSIS'); print('='*100)
 GATE_BATCH_SIZE=512
 
@@ -9312,10 +9312,10 @@ for seed,d0 in gate_val_df.groupby('seed'):
         for b,z in d.groupby('bin',observed=True): br.append({'seed':seed,'feature':feat,'bin':str(b),'n':len(z),'feature_mean':z[feat].mean(),'gate_mean':z.evidence_gate.mean(),'gate_sd':z.evidence_gate.std(ddof=1) if len(z)>1 else 0})
 gate_bins_df=pd.DataFrame(br); GATE_BINS_PATH=os.path.join(RESULT_DIR,'savrec_validation_gate_quantiles_v2.csv'); gate_bins_df.to_csv(GATE_BINS_PATH,index=False)
 gate_clean_mean_by_seed=gate_val_df.groupby('seed').evidence_gate.mean().to_dict()
-display(gate_corr_df); print('✅ Cell 33 complete. Validation only.')
+display(gate_corr_df); print('Cell 33 complete. Validation only.')
 
 
-# %% PUBLIC NOTEBOOK CELL 35
+# %%
 print('='*100); print('CELL 34 — VISUAL AVAILABILITY STRESS TEST'); print('='*100)
 
 def recompute_coherence(images,mask):
@@ -9406,10 +9406,10 @@ stress_val_per_seed_df=run_visual_stress_split(selection_val_df,'validation',reu
 stress_val_summary_df=summarize_stress(stress_val_per_seed_df)
 STRESS_VAL_PER_SEED_PATH=os.path.join(RESULT_DIR,'visual_stress_validation_per_seed_v3.csv'); STRESS_VAL_SUMMARY_PATH=os.path.join(RESULT_DIR,'visual_stress_validation_mean_sd_v3.csv')
 stress_val_per_seed_df.to_csv(STRESS_VAL_PER_SEED_PATH,index=False); stress_val_summary_df.to_csv(STRESS_VAL_SUMMARY_PATH,index=False)
-display(stress_val_summary_df.sort_values(['removal_fraction','model'])); print('✅ Cell 34 complete. No test metric computed.')
+display(stress_val_summary_df.sort_values(['removal_fraction','model'])); print('Cell 34 complete. No test metric computed.')
 
 
-# %% PUBLIC NOTEBOOK CELL 36
+# %%
 # ==============================================================================
 # CELL 34B — MULTI-SEED VISUAL AVAILABILITY STRESS TEST
 # ==============================================================================
@@ -9623,7 +9623,7 @@ for corr_seed in MULTI_STRESS_SEEDS:
             corr_seed, low, high
         )
 
-print('✅ Nested-mask audit passed for all 5 corruption seeds.')
+print('Nested-mask audit passed for all 5 corruption seeds.')
 
 
 # ------------------------------------------------------------------------------
@@ -10008,14 +10008,14 @@ for _p in [
 ]:
     print('  ', _p)
 
-print('\n✅ Cell 34B complete.')
-print('✅ Frozen checkpoints only; no model retraining.')
-print('✅ Five deterministic corruption seeds evaluated on VALIDATION only.')
-print('✅ No test metric computed.')
-print('✅ Canonical visual tensors restored.')
+print('\nCell 34B complete.')
+print('Frozen checkpoints only; no model retraining.')
+print('Five deterministic corruption seeds evaluated on VALIDATION only.')
+print('No test metric computed.')
+print('Canonical visual tensors restored.')
 print('=' * 100)
 
-# %% PUBLIC NOTEBOOK CELL 37
+# %%
 # ==============================================================================
 # CELL 35 — FINAL ANALYSIS FREEZE BEFORE CURRENT-V7 TEST EVALUATION
 # ==============================================================================
@@ -10157,14 +10157,14 @@ freeze_payload = {
 with open(FINAL_ANALYSIS_FREEZE_PATH, 'w') as f:
     json.dump(freeze_payload, f, indent=2)
 
-print('✅ Cell 35 freeze complete.')
-print('✅ 5-seed robustness protocol frozen BEFORE test evaluation.')
-print('✅ Significance comparisons/metrics frozen BEFORE test evaluation.')
-print('✅ Cell 36 may now evaluate test_df. Do not change Cells 30–35 afterward.')
+print('Cell 35 freeze complete.')
+print('5-seed robustness protocol frozen BEFORE test evaluation.')
+print('Significance comparisons/metrics frozen BEFORE test evaluation.')
+print('Cell 36 may now evaluate test_df. Do not change Cells 30–35 afterward.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 38
+# %%
 # ==============================================================================
 # CELL 36 — FINAL CURRENT-V7 TEST EVALUATION + FROZEN MULTI-SEED STRESS TEST
 # ==============================================================================
@@ -10686,13 +10686,13 @@ with open(TEST_MANIFEST_PATH, 'w') as f:
         },
     }, f, indent=2)
 
-print('✅ Cell 36 complete.')
-print('✅ Standard test + frozen 5-corruption-seed stress protocol evaluated.')
-print('✅ Do NOT retune/rebuild any model after seeing these values.')
+print('Cell 36 complete.')
+print('Standard test + frozen 5-corruption-seed stress protocol evaluated.')
+print('Do NOT retune/rebuild any model after seeing these values.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 39
+# %%
 # ==============================================================================
 # CELL 37 — PREDECLARED PAIRED USER-LEVEL SIGNIFICANCE
 # ==============================================================================
@@ -10795,11 +10795,11 @@ SIGNIFICANCE_PATH = os.path.join(
 significance_df.to_csv(SIGNIFICANCE_PATH, index=False)
 
 display(significance_df)
-print('✅ Cell 37 complete.')
+print('Cell 37 complete.')
 
 
 
-# %% PUBLIC NOTEBOOK CELL 40
+# %%
 # ==============================================================================
 # CELL 38 — FINAL PAPER-READY TABLES / FIGURES / MANIFEST
 # ==============================================================================
@@ -10999,10 +10999,10 @@ display(paper_stress_test_table)
 print('\nSIGNIFICANCE')
 display(significance_df)
 
-print('✅ Cells 35–38 complete.')
-print('✅ Final paper exports use the 5-corruption-seed stress protocol.')
+print('Cells 35–38 complete.')
+print('Final paper exports use the 5-corruption-seed stress protocol.')
 
-# %% PUBLIC NOTEBOOK CELL 42
+# %%
 # ==============================================================================
 # CELL 39 — EXPLORATORY MECHANISM / SUBGROUP + COMPLEXITY ANALYSIS
 # ==============================================================================
@@ -11548,10 +11548,10 @@ for p in [
 ]:
     print('  ', p)
 
-print('\n✅ Cell 39 complete.')
-print('✅ No model trained or modified.')
-print('✅ New subgroup/mechanism analyses used validation only.')
-print('✅ Treat these analyses as exploratory/post-hoc in the paper.')
+print('\nCell 39 complete.')
+print('No model trained or modified.')
+print('New subgroup/mechanism analyses used validation only.')
+print('Treat these analyses as exploratory/post-hoc in the paper.')
 print('=' * 100)
 
 # ==============================================================================
@@ -11714,7 +11714,7 @@ if "gate_seed_df" in globals():
     )
 
     print(
-        "✅ Using Cell-39 gate values already available in memory."
+        "Using Cell-39 gate values already available in memory."
     )
 
 else:
@@ -11735,7 +11735,7 @@ else:
     )
 
     print(
-        "✅ Loaded saved Cell-39 gate cache."
+        "Loaded saved Cell-39 gate cache."
     )
 
 
@@ -11922,7 +11922,7 @@ if "train_df" in globals():
     )
 
     print(
-        "✅ Using cleaned training split already available in memory."
+        "Using cleaned training split already available in memory."
     )
 
 else:
@@ -11976,7 +11976,7 @@ else:
     )
 
     print(
-        "✅ Reconstructed cleaned training split from frozen V6 data."
+        "Reconstructed cleaned training split from frozen V6 data."
     )
 
 
@@ -12045,7 +12045,7 @@ if "item_feature_df" in globals():
     )
 
     print(
-        "✅ Using item evidence already available in memory."
+        "Using item evidence already available in memory."
     )
 
 else:
@@ -12064,7 +12064,7 @@ else:
     )
 
     print(
-        "✅ Loaded saved V7 item-evidence table."
+        "Loaded saved V7 item-evidence table."
     )
 
 
@@ -12686,41 +12686,827 @@ print(
 )
 
 print(
-    "✅ CELL 40 COMPLETE"
+    "CELL 40 COMPLETE"
 )
 
 print(
-    "✅ Validation-only exploratory analysis."
+    "Validation-only exploratory analysis."
 )
 
 print(
-    "✅ Existing Cell-39 gate outputs used."
+    "Existing Cell-39 gate outputs used."
 )
 
 print(
-    "✅ Cases selected automatically at 10th/50th/90th gate percentiles."
+    "Cases selected automatically at 10th/50th/90th gate percentiles."
 )
 
 print(
-    "✅ No manual case selection."
+    "No manual case selection."
 )
 
 print(
-    "✅ No model trained."
+    "No model trained."
 )
 
 print(
-    "✅ No checkpoint modified."
+    "No checkpoint modified."
 )
 
 print(
-    "✅ No test metric computed."
+    "No test metric computed."
 )
 
 print(
-    "✅ Primary test results remain unchanged."
+    "Primary test results remain unchanged."
 )
 
 print(
     "=" * 100
 )
+
+
+# %%
+# CELL 41R — POST-HOC HIERARCHICAL ROBUSTNESS BOOTSTRAP
+# ==============================================================================
+#
+# NO TRAINING
+# NO MODEL RETUNING
+# NO CHECKPOINT MODIFICATION
+# NO NEW RECOMMENDATION EVALUATION
+#
+# This cell quantifies uncertainty for the already-completed frozen
+# image-removal experiment from Cell 36.
+#
+# Hierarchy:
+#   1) resample the three independent model-training seeds;
+#   2) within each sampled model seed, resample the five paired corruption
+#      realizations;
+#   3) preserve pairing between SAVRec and Backbone-only.
+#
+# It reports uncertainty for:
+#   A) SAVRec - Backbone NDCG@20 at 25/50/75% image removal;
+#   B) Backbone degradation - SAVRec degradation, where positive values favor
+#      SAVRec because the backbone loses more NDCG@20 from its clean score.
+# ==============================================================================
+
+print("=" * 100)
+print("CELL 41R — POST-HOC HIERARCHICAL ROBUSTNESS BOOTSTRAP")
+print("=" * 100)
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+
+_required = [
+    "stress_test_multiseed_per_run_df",
+    "SEEDS",
+    "FINAL_STRESS_CORRUPTION_SEEDS",
+    "RESULT_DIR",
+    "ARTIFACT_DIR",
+]
+_missing = [x for x in _required if x not in globals()]
+if _missing:
+    raise RuntimeError(
+        "Run the completed final test/stress cells first. Missing: "
+        + ", ".join(_missing)
+    )
+
+BOOTSTRAP_RESAMPLES = 20_000
+BOOTSTRAP_SEED = 2026
+ROBUSTNESS_LEVELS = [0.25, 0.50, 0.75]
+ROBUSTNESS_MODELS = ["Backbone-only", "SAVRec"]
+
+stress_df = stress_test_multiseed_per_run_df.copy()
+stress_df["model_seed"] = stress_df["model_seed"].astype(int)
+stress_df["corruption_seed"] = stress_df["corruption_seed"].astype(int)
+stress_df["removal_fraction"] = stress_df["removal_fraction"].astype(float)
+
+assert set(ROBUSTNESS_MODELS).issubset(set(stress_df["model"]))
+assert set(SEEDS) == set(stress_df["model_seed"].unique())
+assert not stress_df.duplicated(
+    ["model", "model_seed", "corruption_seed", "removal_fraction"]
+).any()
+
+# Clean rows were copied from the standard test evaluation in Cell 36.
+clean = stress_df[np.isclose(stress_df["removal_fraction"], 0.0)].copy()
+assert set(clean["corruption_seed"].unique()) == {-1}
+
+clean_ndcg = {}
+for model_name in ROBUSTNESS_MODELS:
+    z = clean[clean["model"] == model_name]
+    assert set(z["model_seed"]) == set(SEEDS)
+    clean_ndcg[model_name] = {
+        int(r["model_seed"]): float(r["NDCG@20"])
+        for _, r in z.iterrows()
+    }
+
+# Paired corruption table: one row per model_seed x corruption_seed x removal.
+nonzero = stress_df[
+    stress_df["removal_fraction"].isin(ROBUSTNESS_LEVELS)
+].copy()
+
+paired = (
+    nonzero.pivot_table(
+        index=["model_seed", "corruption_seed", "removal_fraction"],
+        columns="model",
+        values="NDCG@20",
+        aggfunc="first",
+    )
+    .reset_index()
+)
+
+assert {"Backbone-only", "SAVRec"}.issubset(paired.columns)
+
+for frac in ROBUSTNESS_LEVELS:
+    d = paired[np.isclose(paired["removal_fraction"], frac)]
+    assert set(d["model_seed"]) == set(SEEDS)
+    for seed in SEEDS:
+        ds = d[d["model_seed"] == seed]
+        assert set(ds["corruption_seed"]) == set(FINAL_STRESS_CORRUPTION_SEEDS)
+
+paired["savrec_minus_backbone"] = (
+    paired["SAVRec"] - paired["Backbone-only"]
+)
+
+paired["backbone_abs_degradation"] = paired.apply(
+    lambda r: clean_ndcg["Backbone-only"][int(r["model_seed"])]
+              - float(r["Backbone-only"]),
+    axis=1,
+)
+paired["savrec_abs_degradation"] = paired.apply(
+    lambda r: clean_ndcg["SAVRec"][int(r["model_seed"])]
+              - float(r["SAVRec"]),
+    axis=1,
+)
+
+# Positive => Backbone degrades more than SAVRec => favors SAVRec.
+paired["degradation_advantage_savrec"] = (
+    paired["backbone_abs_degradation"]
+    - paired["savrec_abs_degradation"]
+)
+
+
+def hierarchical_bootstrap_for_level(level_df, value_col, n_boot, seed):
+    """
+    Resample model seeds first, then paired corruption seeds within each sampled
+    model seed. Pairing between the two compared models has already been reduced
+    to one value per seed/corruption row.
+    """
+    rng = np.random.default_rng(seed)
+    model_seeds = np.asarray(SEEDS, dtype=int)
+    corr_seeds = np.asarray(FINAL_STRESS_CORRUPTION_SEEDS, dtype=int)
+
+    lookup = {}
+    for ms in model_seeds:
+        d = level_df[level_df["model_seed"] == ms].set_index("corruption_seed")
+        assert set(d.index.astype(int)) == set(corr_seeds)
+        lookup[int(ms)] = d[value_col].astype(float).to_dict()
+
+    boots = np.empty(n_boot, dtype=np.float64)
+
+    for b in range(n_boot):
+        sampled_model_seeds = rng.choice(
+            model_seeds, size=len(model_seeds), replace=True
+        )
+        model_level_values = []
+
+        for ms in sampled_model_seeds:
+            sampled_corr = rng.choice(
+                corr_seeds, size=len(corr_seeds), replace=True
+            )
+            vals = [lookup[int(ms)][int(cs)] for cs in sampled_corr]
+            model_level_values.append(float(np.mean(vals)))
+
+        boots[b] = float(np.mean(model_level_values))
+
+    return (
+        float(np.percentile(boots, 2.5)),
+        float(np.percentile(boots, 97.5)),
+    )
+
+
+rows = []
+for j, frac in enumerate(ROBUSTNESS_LEVELS):
+    d = paired[np.isclose(paired["removal_fraction"], frac)].copy()
+
+    ndcg_mean = float(d["savrec_minus_backbone"].mean())
+    ndcg_lo, ndcg_hi = hierarchical_bootstrap_for_level(
+        d,
+        "savrec_minus_backbone",
+        BOOTSTRAP_RESAMPLES,
+        BOOTSTRAP_SEED + 100 * j,
+    )
+
+    deg_mean = float(d["degradation_advantage_savrec"].mean())
+    deg_lo, deg_hi = hierarchical_bootstrap_for_level(
+        d,
+        "degradation_advantage_savrec",
+        BOOTSTRAP_RESAMPLES,
+        BOOTSTRAP_SEED + 100 * j + 1,
+    )
+
+    rows.append({
+        "removal_fraction": frac,
+        "paired_ndcg20_difference_savrec_minus_backbone": ndcg_mean,
+        "paired_ndcg20_ci_low": ndcg_lo,
+        "paired_ndcg20_ci_high": ndcg_hi,
+        "degradation_advantage_savrec": deg_mean,
+        "degradation_advantage_ci_low": deg_lo,
+        "degradation_advantage_ci_high": deg_hi,
+    })
+
+robustness_bootstrap_df = pd.DataFrame(rows)
+
+ROBUSTNESS_BOOTSTRAP_PATH = os.path.join(
+    RESULT_DIR,
+    "posthoc_hierarchical_robustness_bootstrap_v1.csv",
+)
+ROBUSTNESS_BOOTSTRAP_MANIFEST_PATH = os.path.join(
+    ARTIFACT_DIR,
+    "posthoc_hierarchical_robustness_bootstrap_manifest_v1.json",
+)
+
+robustness_bootstrap_df.to_csv(
+    ROBUSTNESS_BOOTSTRAP_PATH,
+    index=False,
+)
+
+with open(ROBUSTNESS_BOOTSTRAP_MANIFEST_PATH, "w") as f:
+    json.dump(
+        {
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "analysis": "post-hoc hierarchical robustness bootstrap",
+            "training_performed": False,
+            "model_loading_performed": False,
+            "new_recommendation_evaluation_performed": False,
+            "model_seeds": [42, 1, 7],
+            "corruption_seeds": [2026, 2027, 2028, 2029, 2030],
+            "removal_fractions": [0.25, 0.50, 0.75],
+            "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+            "bootstrap_seed": BOOTSTRAP_SEED,
+            "hierarchy": (
+                "resample model-training seeds, then paired corruption "
+                "realizations within each sampled model seed"
+            ),
+            "paired_models": ["Backbone-only", "SAVRec"],
+            "source": "already-completed Cell-36 frozen test stress results",
+            "output_csv": ROBUSTNESS_BOOTSTRAP_PATH,
+        },
+        f,
+        indent=2,
+    )
+
+print("\nHIERARCHICAL ROBUSTNESS BOOTSTRAP")
+display(robustness_bootstrap_df)
+
+print("\nSaved:")
+print(ROBUSTNESS_BOOTSTRAP_PATH)
+print(ROBUSTNESS_BOOTSTRAP_MANIFEST_PATH)
+
+print("\nCell 41R complete.")
+print("No training.")
+print("No checkpoint modification.")
+print("No new recommendation evaluation.")
+
+# %%
+# ==============================================================================
+# CELL 42 — FINAL REFERENCE-BASELINE CONFIGURATION AUDIT
+# ==============================================================================
+#
+# NO TRAINING
+# NO MODEL LOADING
+# NO TEST EVALUATION
+#
+# Records the validation-selected configurations used for the final
+# MMGCN-Ref, BM3-Ref, and SMORE three-seed runs. These values were selected
+# using tuning seed 2026 on validation only and were locked before final test
+# evaluation.
+# ==============================================================================
+
+print("=" * 100)
+print("CELL 42 — FINAL REFERENCE-BASELINE CONFIGURATION AUDIT")
+print("=" * 100)
+
+import os
+import json
+import pandas as pd
+from datetime import datetime, timezone
+
+_required = [
+    "REFERENCE_SELECTED_CONFIG",
+    "RESULT_DIR",
+    "ARTIFACT_DIR",
+]
+_missing = [x for x in _required if x not in globals()]
+if _missing:
+    raise RuntimeError(
+        "Run the completed reference-baseline tuning/locking cells first. "
+        "Missing: " + ", ".join(_missing)
+    )
+
+EXPECTED_FINAL_CONFIGS = {
+    "MMGCN-Ref": {
+        "embedding_size": 64,
+        "learning_rate": 1e-4,
+        "reg_weight": 1e-3,
+        "concat": True,
+        "visual_latent_dim": 256,
+    },
+    "BM3-Ref": {
+        "embedding_size": 64,
+        "learning_rate": 1e-3,
+        "n_layers": 1,
+        "dropout": 0.3,
+        "reg_weight": 0.01,
+        "cl_weight": 2.0,
+    },
+    "SMORE": {
+        "embedding_size": 64,
+        "learning_rate": 1e-3,
+        "n_ui_layers": 3,
+        "image_knn_k": 40,
+        "text_knn_k": 10,
+        "reg_weight": 1e-5,
+        "dropout_rate": 0.1,
+        "cl_loss": 0.01,
+        "temperature": 0.2,
+    },
+}
+
+# Best validation user-NDCG@20 from the completed tuning stage (seed 2026).
+TUNING_VALIDATION_NDCG20 = {
+    "MMGCN-Ref": 0.013726,
+    "BM3-Ref": 0.011661,
+    "SMORE": 0.039609,
+}
+
+# Assert that the actually locked configs contain the paper-facing selected values.
+for model_name, expected in EXPECTED_FINAL_CONFIGS.items():
+    assert model_name in REFERENCE_SELECTED_CONFIG, model_name
+    actual = REFERENCE_SELECTED_CONFIG[model_name]
+
+    for key, expected_value in expected.items():
+        assert key in actual, (model_name, key)
+        actual_value = actual[key]
+
+        if isinstance(expected_value, float):
+            assert abs(float(actual_value) - expected_value) < 1e-12, (
+                model_name, key, actual_value, expected_value
+            )
+        else:
+            assert actual_value == expected_value, (
+                model_name, key, actual_value, expected_value
+            )
+
+rows = [
+    {
+        "Model": "MMGCN",
+        "Embedding": 64,
+        "Learning_rate": 1e-4,
+        "Selected_settings": (
+            "lambda=1e-3; visual latent=256; concatenative fusion"
+        ),
+        "Tuning_seed": 2026,
+        "Best_validation_NDCG@20": 0.013726,
+    },
+    {
+        "Model": "BM3",
+        "Embedding": 64,
+        "Learning_rate": 1e-3,
+        "Selected_settings": (
+            "1 layer; dropout=0.3; lambda=0.01; contrastive weight=2.0"
+        ),
+        "Tuning_seed": 2026,
+        "Best_validation_NDCG@20": 0.011661,
+    },
+    {
+        "Model": "SMORE",
+        "Embedding": 64,
+        "Learning_rate": 1e-3,
+        "Selected_settings": (
+            "UI layers=3; image k=40; text k=10; lambda=1e-5; "
+            "dropout=0.1; cl_loss=0.01; temperature=0.2"
+        ),
+        "Tuning_seed": 2026,
+        "Best_validation_NDCG@20": 0.039609,
+    },
+]
+
+baseline_config_paper_df = pd.DataFrame(rows)
+
+BASELINE_CONFIG_PAPER_PATH = os.path.join(
+    RESULT_DIR,
+    "final_reference_baseline_configurations_v1.csv",
+)
+BASELINE_CONFIG_MANIFEST_PATH = os.path.join(
+    ARTIFACT_DIR,
+    "final_reference_baseline_configurations_manifest_v1.json",
+)
+
+baseline_config_paper_df.to_csv(
+    BASELINE_CONFIG_PAPER_PATH,
+    index=False,
+)
+
+with open(BASELINE_CONFIG_MANIFEST_PATH, "w") as f:
+    json.dump(
+        {
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "training_performed": False,
+            "model_loading_performed": False,
+            "evaluation_performed": False,
+            "tuning_seed": 2026,
+            "selection_split": "validation",
+            "selection_metric": "user-NDCG@20",
+            "test_used_for_selection": False,
+            "final_model_seeds": [42, 1, 7],
+            "selected_configs": REFERENCE_SELECTED_CONFIG,
+            "paper_validation_ndcg20": TUNING_VALIDATION_NDCG20,
+            "output_csv": BASELINE_CONFIG_PAPER_PATH,
+        },
+        f,
+        indent=2,
+    )
+
+print("\nFINAL VALIDATION-SELECTED REFERENCE BASELINES")
+display(baseline_config_paper_df)
+
+print("\nSaved:")
+print(BASELINE_CONFIG_PAPER_PATH)
+print(BASELINE_CONFIG_MANIFEST_PATH)
+
+print("\nCell 42 complete.")
+print("Existing locked configurations only.")
+print("No training.")
+print("No test evaluation.")
+
+# %%
+# ==============================================================================
+# CELL 43 — FINAL SAVREC ABLATION PROTOCOL + PER-SEED RESULT AUDIT
+# ==============================================================================
+#
+# NO TRAINING
+# NO MODEL LOADING
+# NO EVALUATION
+#
+# Reconstructs the already-completed Cell-36 ablation results and documents
+# exactly how each ablation/control was performed.
+# ==============================================================================
+
+print("=" * 100)
+print("CELL 43 — FINAL SAVREC ABLATION PROTOCOL AUDIT")
+print("=" * 100)
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+
+DRIVE_PATH = os.environ.get(
+    "SAVREC_DATA_ROOT",
+    "/content/drive/MyDrive/MS_new/Thesis_HotelRec_Data"
+)
+
+EXPERIMENT_ROOT = os.path.join(
+    DRIVE_PATH,
+    "SAVRec_V7_JOURNAL_FINAL_CLEAN"
+)
+
+RESULT_DIR = os.path.join(EXPERIMENT_ROOT, "results")
+ARTIFACT_DIR = os.path.join(EXPERIMENT_ROOT, "artifacts")
+
+os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+SEEDS = [42, 1, 7]
+
+# ==============================================================================
+# 1. EXACT FROZEN ABLATION PROTOCOL
+# ==============================================================================
+
+ABLATION_PROTOCOL = {
+    "model_seeds": [42, 1, 7],
+    "selection_split": "validation",
+    "selection_metric": "user-NDCG@20",
+    "test_used_for_selection": False,
+
+    "evidence_ablation_strategy": (
+        "replace the selected evidence channel with its canonical "
+        "training/catalog mean; architecture/parameter count unchanged"
+    ),
+
+    # The ablated replacement value is used throughout the independently
+    # trained variant, i.e. during BOTH training and inference.
+    "replacement_used_during_training": True,
+    "replacement_used_during_inference": True,
+
+    "important_clarification": (
+        "Each ablation was independently trained. The selected evidence "
+        "channel was not removed only at test time."
+    ),
+
+    "shuffled_evidence_strategy": (
+        "user-side and item-side evidence were independently permuted using "
+        "deterministic seed-specific permutations before separate training"
+    ),
+    "shuffle_user_seed_base": 910000,
+    "shuffle_item_seed_base": 920000,
+}
+
+# ==============================================================================
+# 2. ORIGINAL COMPLETED PER-SEED TEST NDCG@20
+#
+# Order = [seed 42, seed 1, seed 7]
+# ==============================================================================
+
+PER_SEED_NDCG20 = {
+    "Backbone-only": [
+        0.022459,
+        0.021220,
+        0.017223,
+    ],
+    "Full SAVRec": [
+        0.018718,
+        0.020243,
+        0.024598,
+    ],
+    "Shuffled evidence": [
+        0.022687,
+        0.021324,
+        0.017361,
+    ],
+    "SAVRec - History": [
+        0.022020,
+        0.018660,
+        0.020925,
+    ],
+    "SAVRec - Popularity": [
+        0.015283,
+        0.017957,
+        0.012052,
+    ],
+    "SAVRec - Availability": [
+        0.025726,
+        0.020006,
+        0.017460,
+    ],
+    "SAVRec - Coherence": [
+        0.022695,
+        0.020971,
+        0.020282,
+    ],
+}
+
+EXPECTED_MEANS = {
+    "Backbone-only": 0.020301,
+    "Full SAVRec": 0.021186,
+    "Shuffled evidence": 0.020458,
+    "SAVRec - History": 0.020535,
+    "SAVRec - Popularity": 0.015097,
+    "SAVRec - Availability": 0.021064,
+    "SAVRec - Coherence": 0.021316,
+}
+
+# ==============================================================================
+# 3. BUILD PER-SEED TABLE
+# ==============================================================================
+
+per_seed_rows = []
+for variant, values in PER_SEED_NDCG20.items():
+    assert len(values) == len(SEEDS)
+
+    for seed, value in zip(SEEDS, values):
+        per_seed_rows.append({
+            "Variant": variant,
+            "Seed": int(seed),
+            "NDCG@20": float(value),
+        })
+
+ablation_per_seed_df = pd.DataFrame(per_seed_rows)
+
+# ==============================================================================
+# 4. SUMMARY = MEAN ± SAMPLE SD
+# ==============================================================================
+
+full_mean_reconstructed = float(
+    np.mean(PER_SEED_NDCG20["Full SAVRec"])
+)
+
+summary_rows = []
+
+PAPER_ORDER = [
+    "Backbone-only",
+    "Shuffled evidence",
+    "SAVRec - History",
+    "SAVRec - Popularity",
+    "SAVRec - Availability",
+    "SAVRec - Coherence",
+    "Full SAVRec",
+]
+
+for variant in PAPER_ORDER:
+    values = np.asarray(PER_SEED_NDCG20[variant], dtype=float)
+
+    mean_value = float(values.mean())
+    sd_value = float(values.std(ddof=1))
+
+    change_pct = (
+        np.nan
+        if variant == "Full SAVRec"
+        else (mean_value - full_mean_reconstructed)
+             / full_mean_reconstructed
+             * 100.0
+    )
+
+    if variant == "Backbone-only":
+        protocol = "matched evidence-free backbone"
+    elif variant == "Shuffled evidence":
+        protocol = (
+            "independently trained with deterministic user/item "
+            "evidence permutations"
+        )
+    elif variant == "Full SAVRec":
+        protocol = "full evidence controller"
+    else:
+        protocol = (
+            "independently trained; selected evidence channel "
+            "replaced by canonical mean during training and inference"
+        )
+
+    summary_rows.append({
+        "Variant": variant,
+        "Seeds": 3,
+        "NDCG@20_mean": mean_value,
+        "NDCG@20_sd": sd_value,
+        "Change_vs_full_pct": change_pct,
+        "Protocol": protocol,
+    })
+
+ablation_summary_df = pd.DataFrame(summary_rows)
+
+# ==============================================================================
+# 5. VERIFY AGAINST THE COMPLETED FINAL MEANS
+# ==============================================================================
+
+print("\nVERIFYING ORIGINAL COMPLETED ABLATION MEANS\n")
+
+for variant, expected in EXPECTED_MEANS.items():
+    got = float(
+        ablation_summary_df.loc[
+            ablation_summary_df["Variant"] == variant,
+            "NDCG@20_mean",
+        ].iloc[0]
+    )
+
+    print(
+        f"{variant:<24} "
+        f"reconstructed={got:.6f} | "
+        f"original={expected:.6f}"
+    )
+
+    # Per-seed console values were stored to six decimals.
+    assert abs(got - expected) < 1.1e-6
+
+print("\nReconstructed ablation means reproduce the completed experiment.")
+
+# ==============================================================================
+# 6. IMPORTANT POPULARITY + SHUFFLE CHECKS
+# ==============================================================================
+
+full_mean = float(EXPECTED_MEANS["Full SAVRec"])
+backbone_mean = float(EXPECTED_MEANS["Backbone-only"])
+pop_mean = float(EXPECTED_MEANS["SAVRec - Popularity"])
+shuffle_mean = float(EXPECTED_MEANS["Shuffled evidence"])
+
+pop_change_vs_full = (
+    (pop_mean - full_mean) / full_mean * 100.0
+)
+pop_change_vs_backbone = (
+    (pop_mean - backbone_mean) / backbone_mean * 100.0
+)
+shuffle_change_vs_full = (
+    (shuffle_mean - full_mean) / full_mean * 100.0
+)
+
+assert abs(pop_change_vs_full - (-28.74)) < 0.02
+assert pop_mean < backbone_mean
+assert abs(shuffle_change_vs_full - (-3.44)) < 0.02
+
+# ==============================================================================
+# 7. PAPER-FACING TABLE
+# ==============================================================================
+
+ablation_paper_df = ablation_summary_df[
+    [
+        "Variant",
+        "NDCG@20_mean",
+        "NDCG@20_sd",
+        "Change_vs_full_pct",
+    ]
+].copy()
+
+# ==============================================================================
+# 8. SAVE AUDIT ARTIFACTS
+# ==============================================================================
+
+PER_SEED_PATH = os.path.join(
+    RESULT_DIR,
+    "final_savrec_ablation_per_seed_recovered_v1.csv",
+)
+SUMMARY_PATH = os.path.join(
+    RESULT_DIR,
+    "final_savrec_ablation_summary_recovered_v1.csv",
+)
+PAPER_PATH = os.path.join(
+    RESULT_DIR,
+    "final_savrec_ablation_paper_v1.csv",
+)
+MANIFEST_PATH = os.path.join(
+    ARTIFACT_DIR,
+    "final_savrec_ablation_protocol_manifest_v1.json",
+)
+
+ablation_per_seed_df.to_csv(PER_SEED_PATH, index=False)
+ablation_summary_df.to_csv(SUMMARY_PATH, index=False)
+ablation_paper_df.to_csv(PAPER_PATH, index=False)
+
+with open(MANIFEST_PATH, "w") as f:
+    json.dump(
+        {
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "training_performed": False,
+            "model_loading_performed": False,
+            "evaluation_performed": False,
+            "source": (
+                "already-completed final experiment and stored per-seed "
+                "Cell-36 console results"
+            ),
+            "protocol": ABLATION_PROTOCOL,
+            "per_seed_ndcg20": PER_SEED_NDCG20,
+            "final_means": EXPECTED_MEANS,
+            "important_note": (
+                "Numerical values are reconstructed from the completed "
+                "experiment logs. No new test evaluation was performed."
+            ),
+        },
+        f,
+        indent=2,
+    )
+
+# ==============================================================================
+# 9. DISPLAY
+# ==============================================================================
+
+print("\nFINAL ABLATION TABLE\n")
+display(ablation_paper_df)
+
+print("\nKEY INTERPRETATION")
+
+print(
+    f"""
+Full SAVRec NDCG@20       : {full_mean:.6f}
+Backbone-only NDCG@20    : {backbone_mean:.6f}
+SAVRec - Popularity      : {pop_mean:.6f}
+
+Removing popularity:
+  Change vs Full SAVRec   : {pop_change_vs_full:.2f}%
+  Change vs Backbone      : {pop_change_vs_backbone:.2f}%
+
+Shuffled evidence:
+  NDCG@20                 : {shuffle_mean:.6f}
+  Change vs Full SAVRec   : {shuffle_change_vs_full:.2f}%
+
+IMPORTANT:
+The no-popularity result is from a SEPARATELY TRAINED ablation model.
+Popularity was replaced by its canonical mean during both training and
+inference. It was NOT an inference-time removal from the full SAVRec model.
+""".strip()
+)
+
+print("\nPAPER METHOD SENTENCE\n")
+print(
+    """
+Each evidence ablation was independently trained for all three model seeds
+using the same SAVRec training protocol. For a removed evidence variable, the
+corresponding channel was replaced by its canonical training/catalog mean
+during both training and inference, preserving the evidence-vector
+dimensionality and model parameter count. For the shuffled-evidence control,
+user-side and item-side evidence were independently permuted using
+deterministic seed-specific permutations before training.
+""".strip()
+)
+
+print("\nSaved:")
+print(PER_SEED_PATH)
+print(SUMMARY_PATH)
+print(PAPER_PATH)
+print(MANIFEST_PATH)
+
+print("\nCell 43 complete.")
+print("No training.")
+print("No model loading.")
+print("No new test evaluation.")
